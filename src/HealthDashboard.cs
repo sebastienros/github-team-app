@@ -8,7 +8,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
-namespace Aspire.TeamApp;
+namespace GitHub.TeamApp;
 
 internal sealed class HealthDashboard
 {
@@ -41,14 +41,10 @@ internal sealed class HealthDashboard
         var now = _clock.GetUtcNow();
         var usable = accounts.Where(a => a.Active && a.Token.Length > 0 && a.Login.Length > 0).ToArray();
         var pipelines = prefs["azurePipelines"].Objects().Select(p => (JsonObject)p.DeepClone()).ToArray();
-        var repositories = usable.SelectMany(a => a.Repos).Distinct().ToArray();
-        var discoverable = usable.Where(a => GitHubHost(a.Host) == "github.com")
-            .SelectMany(a => a.Repos).Distinct().ToArray();
+        var repositories = usable.SelectMany(a => a.Repos).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         var items = new ConcurrentDictionary<string, JsonObject>(StringComparer.Ordinal);
         var successful = new ConcurrentDictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         var errors = new ConcurrentBag<(string? Source, string Message)>();
-        var knownPipelines = new HashSet<string>(pipelines.Select(p => p.Text("id")).Where(id => id.Length > 0));
-        JsonObject discovery = new() { ["pipelines"] = new JsonArray(), ["warnings"] = new JsonArray(), ["providers"] = new JsonArray() };
 
         async Task LoadGitHubAsync(Account account, string repository)
         {
@@ -82,24 +78,9 @@ internal sealed class HealthDashboard
             items[item.Text("id")] = item;
         }
 
-        async Task DiscoverAsync()
-        {
-            discovery = await _azure.DiscoverAsync(discoverable, ct);
-            foreach (var warning in discovery["warnings"].Strings())
-            {
-                errors.Add((null, $"Azure DevOps discovery: {warning}"));
-            }
-            var discovered = discovery["pipelines"].Objects()
-                .Where(p => p.Text("id").Length > 0 && knownPipelines.Add(p.Text("id"))).ToArray();
-            await Task.WhenAll(discovered.Select(LoadAzureAsync));
-        }
-
         var jobs = usable.SelectMany(account => account.Repos.Select(repository => LoadGitHubAsync(account, repository))).ToList();
+        // The caller supplies repository-scoped pipelines; never expand that scope through discovery.
         jobs.AddRange(pipelines.Select(LoadAzureAsync));
-        if (discoverable.Length > 0)
-        {
-            jobs.Add(DiscoverAsync());
-        }
         await Task.WhenAll(jobs);
         ct.ThrowIfCancellationRequested();
 
@@ -113,7 +94,7 @@ internal sealed class HealthDashboard
             .Select(e => e.Message).Distinct().Order(StringComparer.Ordinal).ToArray();
         var configured = usable.Length > 0 || pipelines.Length > 0;
         var githubCount = ordered.Count(item => item.Text("provider") == "github");
-        var configuredAzure = ordered.Where(item => item.Text("provider") == "azure-devops" && !item.Flag("discovered")).ToArray();
+        var configuredAzure = ordered.Where(item => item.Text("provider") == "azure-devops").ToArray();
         var unavailableAzure = configuredAzure.Count(item => item.Text("state") == "unavailable");
         var githubFailed = errors.Any(e => e.Source is not null && !successful.ContainsKey(e.Source));
         var providers = new JsonArray
@@ -126,24 +107,17 @@ internal sealed class HealthDashboard
                 ["sourceCount"] = githubCount
             }
         };
-        foreach (var provider in discovery["providers"].Objects())
+        providers.Add((JsonNode)new JsonObject
         {
-            providers.Add(provider.DeepClone());
-        }
-        if (pipelines.Length > 0 || discoverable.Length == 0)
-        {
-            providers.Add((JsonNode)new JsonObject
-            {
-                ["provider"] = "azure-devops",
-                ["scope"] = "configured",
-                ["status"] = pipelines.Length == 0 ? "not_configured"
-                    : unavailableAzure == 0 ? "available"
-                    : unavailableAzure == configuredAzure.Length ? "unavailable" : "partial",
-                ["message"] = pipelines.Length == 0 ? "No Azure DevOps pipelines are configured."
-                    : unavailableAzure > 0 ? "Some configured Azure DevOps health sources could not be loaded." : null,
-                ["sourceCount"] = configuredAzure.Length
-            });
-        }
+            ["provider"] = "azure-devops",
+            ["scope"] = "configured",
+            ["status"] = pipelines.Length == 0 ? "not_configured"
+                : unavailableAzure == 0 ? "available"
+                : unavailableAzure == configuredAzure.Length ? "unavailable" : "partial",
+            ["message"] = pipelines.Length == 0 ? "No Azure DevOps pipelines are configured."
+                : unavailableAzure > 0 ? "Some configured Azure DevOps health sources could not be loaded." : null,
+            ["sourceCount"] = configuredAzure.Length
+        });
         return new JsonObject
         {
             ["authenticated"] = configured,
@@ -186,9 +160,9 @@ internal sealed class HealthDashboard
         var branch = repo["defaultBranchRef"] as JsonObject;
         var name = repo.Text("nameWithOwner", repository);
         var url = repo.Text("url", $"https://{host}/{repository}");
-        if (Uri.TryCreate(url, UriKind.Absolute, out var repositoryUri))
+        if (!name.Equals(repository, StringComparison.OrdinalIgnoreCase) || !GitHubDashboard.IsRepositoryUrl(url, host, repository))
         {
-            host = repositoryUri.Host.ToLowerInvariant();
+            throw new HealthProviderException("GitHub returned a different repository than requested");
         }
         var id = $"github:{host}/{name.ToLowerInvariant()}";
         var item = new JsonObject
@@ -289,7 +263,7 @@ internal sealed class HealthDashboard
             contexts.AddRange(checkConnection["nodes"].Objects());
         }
         var failedChecks = NormalizeChecks(contexts).Where(c => c.Text("state") is "failing" or "degraded").ToArray();
-        var pullRequest = SelectPullRequest(head["associatedPullRequests"]?["nodes"]);
+        var pullRequest = SelectPullRequest(head["associatedPullRequests"]?["nodes"], host, repository);
         var success = FindSuccess(history);
         var lastSuccessAt = success?.Text("committedDate");
         var state = RollupState(head["statusCheckRollup"].Text("state"));
@@ -550,9 +524,10 @@ internal sealed class HealthDashboard
         }
     }
 
-    private static JsonObject? SelectPullRequest(JsonNode? nodes)
+    private static JsonObject? SelectPullRequest(JsonNode? nodes, string host, string repository)
     {
-        var candidates = nodes.Objects().Where(p => p.Number("number") > 0 && p.Text("url").Length > 0).ToArray();
+        var candidates = nodes.Objects().Where(p => p.Number("number") > 0 &&
+            GitHubDashboard.IsRepositoryUrl(p.Text("url"), host, repository)).ToArray();
         var selected = candidates.FirstOrDefault(p => p.Text("mergedAt").Length > 0) ?? candidates.FirstOrDefault();
         if (selected is null)
         {
@@ -577,7 +552,7 @@ internal sealed class HealthDashboard
     {
         using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
         request.Headers.Authorization = new AuthenticationHeaderValue("bearer", token);
-        request.Headers.UserAgent.ParseAdd("aspire-team-app");
+        request.Headers.UserAgent.ParseAdd("github-team-app");
         request.Content = new StringContent(new JsonObject { ["query"] = query, ["variables"] = variables }.ToJsonString(), Encoding.UTF8, "application/json");
         using var response = await _http.SendAsync(request, ct);
         if (!response.IsSuccessStatusCode)

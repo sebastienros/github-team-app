@@ -8,7 +8,7 @@ using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 
-namespace Aspire.TeamApp;
+namespace GitHub.TeamApp;
 
 internal static class Program
 {
@@ -25,21 +25,22 @@ internal static class Program
             if (args is ["--help"] or ["-h"] or ["help"])
             {
                 Console.WriteLine("""
-                    Aspire Team App
+                    GitHub Team App
 
-                    aspire-team [--port PORT] [--no-browser] [--data-dir DIRECTORY]
-                    aspire-team doctor [--json]
+                    github-team [--port PORT] [--no-browser] [--data-dir DIRECTORY]
+                    github-team doctor [--json]
 
                     Serves the dashboard on loopback and opens your default browser.
                     The default port is assigned by the operating system.
-                    ASPIRE_TEAM_APP_HOME overrides the default preferences directory.
+                    GITHUB_TEAM_APP_HOME overrides the default preferences directory.
                     """);
                 return 0;
             }
             var port = 0;
             var browser = true;
-            var directory = Environment.GetEnvironmentVariable("ASPIRE_TEAM_APP_HOME")
-                ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Aspire", "TeamApp");
+            var directory = Environment.GetEnvironmentVariable("GITHUB_TEAM_APP_HOME")
+                ?? Environment.GetEnvironmentVariable("ASPIRE_TEAM_APP_HOME")
+                ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "GitHub", "TeamApp");
             for (var i = 0; i < args.Length; i++)
             {
                 switch (args[i])
@@ -78,7 +79,7 @@ internal static class Program
             app.Run(context => HandleAsync(context, app.Services));
             await app.StartAsync(shutdown.Token);
             var address = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
-            Console.WriteLine($"Aspire Team App: {address}");
+            Console.WriteLine($"GitHub Team App: {address}");
             if (browser)
             {
                 try
@@ -99,7 +100,7 @@ internal static class Program
         }
         catch (Exception error)
         {
-            Console.Error.WriteLine($"Aspire Team App: {error.Message}");
+            Console.Error.WriteLine($"GitHub Team App: {error.Message}");
             return 1;
         }
     }
@@ -141,12 +142,12 @@ internal static class Program
                 context.Response.StatusCode = StatusCodes.Status204NoContent;
                 return;
             }
-            if (context.Request.Method == "GET" && path is "/" or "/index.html" or "/app.js" or "/styles.css" or "/standalone.js")
+            if (context.Request.Method == "GET" && path is "/" or "/index.html" or "/app.js" or "/styles.css" or "/theme.js" or "/standalone.js")
             {
                 if (path == "/standalone.js")
                 {
                     context.Response.ContentType = "text/javascript";
-                    await context.Response.WriteAsync("window.aspireTeamStandalone = true;", cancellationToken);
+                    await context.Response.WriteAsync("window.githubTeamStandalone = true;", cancellationToken);
                     return;
                 }
                 var asset = path is "/" or "/index.html" ? "index.html" : path[1..];
@@ -154,16 +155,7 @@ internal static class Program
                     ?? throw new InvalidOperationException($"Missing embedded browser asset: {asset}");
                 context.Response.ContentType = asset.EndsWith(".css", StringComparison.Ordinal) ? "text/css"
                     : asset.EndsWith(".js", StringComparison.Ordinal) ? "text/javascript" : "text/html";
-                if (asset == "index.html")
-                {
-                    using var reader = new StreamReader(stream);
-                    var html = await reader.ReadToEndAsync(cancellationToken);
-                    await context.Response.WriteAsync(html.Replace("<head>", "<head>\n    <script src=\"standalone.js\"></script>", StringComparison.Ordinal), cancellationToken);
-                }
-                else
-                {
-                    await stream.CopyToAsync(context.Response.Body, cancellationToken);
-                }
+                await stream.CopyToAsync(context.Response.Body, cancellationToken);
                 return;
             }
 
@@ -190,7 +182,15 @@ internal static class Program
                         return;
                     case "/api/accounts":
                         dashboard.InvalidateAccounts();
-                        await JsonAsync(context, await dashboard.GetAsync(client, true, cancellationToken));
+                        await JsonAsync(context, new JsonObject
+                        {
+                            ["accounts"] = await dashboard.DiscoverAccountsAsync(cancellationToken)
+                        });
+                        return;
+                    case "/api/repositories/search":
+                        await JsonAsync(context, await services.GetRequiredService<AccountService>().SearchRepositoriesAsync(
+                            await preferences.ReadAsync(cancellationToken),
+                            context.Request.Query["accountId"].ToString(), context.Request.Query["q"].ToString(), cancellationToken));
                         return;
                     case "/api/session/configuration":
                         await JsonAsync(context, SessionLauncher.GetConfiguration(await preferences.ReadAsync(cancellationToken)));
@@ -261,12 +261,21 @@ internal static class Program
             }
             if (path == "/api/health/pipeline/add")
             {
+                var selected = RepositoryCatalog.Selected(await preferences.ReadAsync(cancellationToken))
+                    ?? throw new ArgumentException("Select a repository before adding a pipeline.");
+                var selectedId = selected.Text("id");
                 var pipeline = await services.GetRequiredService<HealthDashboard>()
                     .ResolvePipelineAsync(body.Text("url"), body.Text("branch"), cancellationToken);
                 await preferences.UpdateAsync(p =>
                 {
+                    if (p.Text("selectedRepository") != selectedId)
+                    {
+                        throw new ArgumentException("The selected repository changed. Add the pipeline again.");
+                    }
+                    pipeline["repositoryId"] = selectedId;
                     var pipelines = p["azurePipelines"] as JsonArray ?? throw new InvalidDataException("Invalid pipeline preferences.");
-                    var old = pipelines.OfType<JsonObject>().FirstOrDefault(item => item.Text("id") == pipeline.Text("id"));
+                    var old = pipelines.OfType<JsonObject>().FirstOrDefault(item => item.Text("id") == pipeline.Text("id") &&
+                        item.Text("repositoryId") == selectedId);
                     if (old is not null)
                     {
                         pipelines.Remove(old);
@@ -283,9 +292,20 @@ internal static class Program
             }
             else if (path != "/api/refresh")
             {
+                if (path == "/api/repositories/add")
+                {
+                    var accountId = RepositoryCatalog.ParseAccount(body.Text("accountId")).AccountId;
+                    var available = await services.GetRequiredService<AccountService>()
+                        .ResolveAsync(await preferences.ReadAsync(cancellationToken), cancellationToken);
+                    if (!available.Any(account => account.Id == accountId && account.Metadata.Text("status") != "failed"))
+                    {
+                        throw new ArgumentException("Choose an available GitHub account. Refresh accounts to sign in.");
+                    }
+                }
                 await preferences.UpdateAsync(p => UpdatePreferences(p, path, body), cancellationToken);
                 dashboard.InvalidateAccounts();
             }
+            dashboard.ConfigurationChanged();
             await JsonAsync(context, await dashboard.GetAsync(client, true, cancellationToken));
         }
         catch (Exception error) when (error is ArgumentException or JsonException or InvalidOperationException or FormatException or NotSupportedException)
@@ -330,9 +350,20 @@ internal static class Program
                 prefs["mode"] = mode;
                 break;
             case "/api/prefs":
-                if (!string.IsNullOrWhiteSpace(body.Text("release")))
+                if (body.ContainsKey("release"))
                 {
                     prefs["release"] = body.Text("release").Trim();
+                }
+                if (body.ContainsKey("teamMembers"))
+                {
+                    var members = body.Text("teamMembers").Split([',', ' ', '\r', '\n', '\t'], StringSplitOptions.RemoveEmptyEntries)
+                        .Select(value => value.TrimStart('@').ToLowerInvariant()).Distinct().ToArray();
+                    if (members.Length > 100 || members.Any(value => value.Length is 0 or > 100 ||
+                        !value.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_')))
+                    {
+                        throw new ArgumentException("Team members must be GitHub logins separated by commas or spaces (at most 100).");
+                    }
+                    prefs["teamMembers"] = JsonData.Array(members);
                 }
                 prefs["showDrafts"] = body.Flag("showDrafts");
                 if (body["notifications"] is JsonObject notifications && prefs["notifications"] is JsonObject saved)
@@ -345,6 +376,15 @@ internal static class Program
                         }
                     }
                 }
+                break;
+            case "/api/repositories/add":
+                RepositoryCatalog.Add(prefs, body.Text("accountId"), body.Text("repository"));
+                break;
+            case "/api/repositories/select":
+                RepositoryCatalog.Select(prefs, body.Text("id"));
+                break;
+            case "/api/repositories/remove":
+                RepositoryCatalog.Remove(prefs, body.Text("id"));
                 break;
             case "/api/account/repos":
             case "/api/account/toggle":
@@ -369,11 +409,32 @@ internal static class Program
                     var repos = body.Text("repos").Split([',', ' ', '\r', '\n', '\t'], StringSplitOptions.RemoveEmptyEntries)
                         .Select(SessionLauncher.NormalizeRepository).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
                     configuration["repos"] = JsonData.Array(repos);
+                    var accountId = RepositoryCatalog.ParseAccount(id).AccountId;
+                    foreach (var removed in prefs["repositories"].Objects()
+                        .Where(item => item.Text("accountId") == accountId && !repos.Contains(item.Text("repository")))
+                        .Select(item => item.Text("id")).ToArray())
+                    {
+                        RepositoryCatalog.Remove(prefs, removed);
+                    }
+                    var wasActive = configuration.Flag("active");
+                    foreach (var repository in repos)
+                    {
+                        var entry = RepositoryCatalog.Create(accountId, repository);
+                        if (!prefs["repositories"].Objects().Any(item => item.Text("id") == entry.Text("id")))
+                        {
+                            RepositoryCatalog.Add(prefs, accountId, repository);
+                        }
+                    }
+                    if (accounts[accountId] is JsonObject canonicalConfiguration)
+                    {
+                        canonicalConfiguration["active"] = wasActive;
+                    }
                 }
                 break;
             case "/api/health/pipeline/remove":
                 var pipelines = prefs["azurePipelines"] as JsonArray ?? throw new InvalidDataException("Invalid pipeline preferences.");
-                var pipeline = pipelines.OfType<JsonObject>().FirstOrDefault(item => item.Text("id") == body.Text("id"))
+                var pipeline = pipelines.OfType<JsonObject>().FirstOrDefault(item => item.Text("id") == body.Text("id") &&
+                    item.Text("repositoryId") == prefs.Text("selectedRepository"))
                     ?? throw new ArgumentException("The pipeline is no longer configured.");
                 pipelines.Remove(pipeline);
                 break;

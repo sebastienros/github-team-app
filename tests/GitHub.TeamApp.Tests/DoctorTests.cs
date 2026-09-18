@@ -6,7 +6,7 @@ using System.ComponentModel;
 using System.Text.Json.Nodes;
 using Xunit;
 
-namespace Aspire.TeamApp.Tests;
+namespace GitHub.TeamApp.Tests;
 
 public class DoctorTests
 {
@@ -173,7 +173,7 @@ public class DoctorTests
         using var writer = new StringWriter();
         var exitCode = await Doctor.RunAsync(false, new JsonObject(), TestContext.Current.CancellationToken, SuccessfulProcess, writer, protocolProbe: () => false);
         var expected = await Doctor.CheckAsync(new JsonObject(), TestContext.Current.CancellationToken, SuccessfulProcess, protocolProbe: () => false);
-        var lines = new List<string> { "Aspire Team App doctor" };
+        var lines = new List<string> { "GitHub Team App doctor" };
         foreach (var check in expected["checks"].Objects())
         {
             lines.Add($"[{check.Text("status").ToUpperInvariant()}] {check.Text("label")} ({(check.Flag("required") ? "required" : "optional")}): {check.Text("message")}");

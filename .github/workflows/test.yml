@@ -1,0 +1,25 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Backend tests
+        run: dotnet run --project tests/GitHub.TeamApp.Tests -- --filter-not-trait "quarantined=true" --filter-not-trait "outerloop=true"
+      - name: Browser rendering tests
+        run: node --test tests/browser/render.test.mjs

@@ -7,7 +7,7 @@ using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
-namespace Aspire.TeamApp;
+namespace GitHub.TeamApp;
 
 internal sealed class AccountService
 {
@@ -101,13 +101,11 @@ internal sealed class AccountService
             var first = group.First();
             var config = configurations[group.Key] ??
                 (first.Candidate.Host == "github.com" ? configurations[$"acct:{first.Login.Trim().ToLowerInvariant()}"] : null);
-            var repos = config?["repos"].Strings().Distinct(StringComparer.Ordinal).ToArray() ?? [];
-            if (repos.Length == 0)
-            {
-                repos = first.Candidate.Host == "github.com" && IsEmuLogin(first.Login)
-                    ? [.. DashboardConstants.DefaultEmuRepos] : [.. DashboardConstants.DefaultRepos];
-            }
-            foreach (var probe in group.Where(p => p.Status != "failed"))
+            var repos = prefs.ContainsKey("repositories")
+                ? prefs["repositories"].Objects().Where(item => item.Text("accountId") == group.Key)
+                    .Select(item => item.Text("repository")).Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
+                : config?["repos"].Strings().Distinct(StringComparer.Ordinal).ToArray() ?? [];
+            foreach (var probe in group.Where(p => p.Status != "failed" && repos.Length > 0))
             {
                 try
                 {
@@ -189,6 +187,47 @@ internal sealed class AccountService
             accounts[0] = strongest with { Active = true };
         }
         return accounts;
+    }
+
+    public async Task<JsonObject> SearchRepositoriesAsync(JsonObject prefs, string accountId, string query, CancellationToken ct)
+    {
+        var normalizedId = RepositoryCatalog.ParseAccount(accountId).AccountId;
+        query = query.Trim();
+        if (query.Length is < 1 or > 200 || query.Any(char.IsControl))
+        {
+            throw new ArgumentException("Enter between 1 and 200 characters to search repositories.");
+        }
+        var account = (await ResolveAsync(prefs, ct)).FirstOrDefault(item => item.Id == normalizedId &&
+            item.Metadata.Text("status") != "failed")
+            ?? throw new ArgumentException("This account is unavailable. Refresh accounts and sign in with GitHub CLI.");
+        using var request = GitHubDashboardTransport.Request(HttpMethod.Get,
+            $"{GitHubDashboardTransport.RestUrl(account.Host)}/search/repositories?q={Uri.EscapeDataString(query)}&per_page=20",
+            account.Token);
+        using var response = await _http.SendAsync(request, ct);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new HttpRequestException($"Repository search failed (HTTP {(int)response.StatusCode}).");
+        }
+        var raw = await response.Content.ReadAsStringAsync(ct);
+        var result = JsonNode.Parse(raw) as JsonObject
+            ?? throw new InvalidDataException("Repository search returned invalid JSON.");
+        if (result["items"] is not JsonArray)
+        {
+            throw new InvalidDataException("Repository search returned no repository list.");
+        }
+        var items = new JsonArray();
+        foreach (var item in result["items"].Objects())
+        {
+            var repository = RepositoryCatalog.NormalizeName(item.Text("full_name"));
+            items.Add((JsonNode)new JsonObject
+            {
+                ["repository"] = repository,
+                ["description"] = item.Text("description"),
+                ["url"] = $"https://{account.Host}/{repository}",
+                ["private"] = item.Flag("private")
+            });
+        }
+        return new JsonObject { ["items"] = items };
     }
 
     public static string AccountId(string login, string host) =>

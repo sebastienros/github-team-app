@@ -2,25 +2,21 @@ import assert from "node:assert/strict";
 import vm from "node:vm";
 import test from "node:test";
 
-import { APP_JS, STYLES } from "./render.mjs";
+import { APP_JS, STYLES, HTML, THEME_JS } from "./render.mjs";
 
-test("renderer follows Primer and canvas theme tokens with system color-scheme fallbacks", () => {
-  assert.match(STYLES, /--bg: var\(--bgColor-default, var\(--background-color-default, var\(--fallback-bg\)\)\)/);
-  assert.match(STYLES, /--fg: var\(--fgColor-default, var\(--text-color-default, var\(--fallback-fg\)\)\)/);
-  assert.match(STYLES, /--muted: var\(--fgColor-muted, var\(--text-color-muted, var\(--fallback-muted\)\)\)/);
-  assert.match(STYLES, /--border: var\(--borderColor-default, var\(--border-color-default, var\(--fallback-border\)\)\)/);
-  assert.match(STYLES, /--focus: var\(--focus-outlineColor, var\(--color-focus-outline, var\(--fallback-focus\)\)\)/);
-  assert.match(STYLES, /--white: var\(--fgColor-onEmphasis, var\(--color-white, #ffffff\)\)/);
-  assert.match(STYLES, /@media \(prefers-color-scheme: dark\) \{[\s\S]*?--fallback-bg: #0d1117/);
-  assert.match(STYLES, /:root\[data-color-mode="light"\] \{[\s\S]*?--fallback-bg: #ffffff/);
-  assert.match(STYLES, /:root\[data-color-mode="dark"\] \{[\s\S]*?--fallback-bg: #0d1117/);
-  assert.match(STYLES, /--surface: color-mix\(in srgb, var\(--bg\), var\(--fg\) 5%\)/);
-  assert.match(STYLES, /data-color-mode="light".*color-scheme: light/);
-  assert.match(STYLES, /data-color-mode="dark".*color-scheme: dark/);
-  assert.match(STYLES, /color: color-mix\(in srgb, var\(--pill-tone\), var\(--fg\) 25%\)/);
-  assert.match(STYLES, /\.ent-badge \{[\s\S]*?color: color-mix\(in srgb, var\(--blue\), var\(--fg\) 25%\)/);
-  assert.match(STYLES, /--shadow-floating: var\(--shadow-floating-small,/);
-  assert.match(STYLES, /\.cb-menu \{[\s\S]*?box-shadow: var\(--shadow-floating\)/);
+test("renderer uses Clawpilot theme variables and CSP-safe external scripts", () => {
+  assert.match(STYLES, /--cp-bg: #f7f4ef/);
+  assert.match(STYLES, /html\[data-theme="dark"\][\s\S]*?--cp-bg: #3d3b3a/);
+  assert.match(STYLES, /background: var\(--cp-bg\)/);
+  assert.match(STYLES, /color: var\(--cp-text\)/);
+  assert.match(STYLES, /--font: "Segoe UI", Aptos, Calibri/);
+  assert.doesNotMatch(STYLES.split("* { box-sizing: border-box; }")[1], /#[\da-f]{3,8}\b|rgba?\(/i);
+  assert.match(HTML, /<script src="theme.js"><\/script>\s*<script src="standalone.js"><\/script>/);
+  assert.deepEqual([...HTML.matchAll(/<script src="([^"]+)"/g)].map(match => match[1]),
+    ["theme.js", "standalone.js", "app.js"]);
+  assert.doesNotMatch(HTML + APP_JS, /<script>|style=|onerror=|Aspire|aspireTeamStandalone/);
+  assert.match(HTML, /GitHub Team App/);
+  assert.match(APP_JS, /window.githubTeamStandalone/);
   // Deterministic load bar replaced the looping indeterminate one (no glow, no paintfill).
   assert.match(STYLES, /\.loadbar \{[\s\S]*?transition: width/);
   assert.doesNotMatch(STYLES, /animation: paintfill/);
@@ -30,6 +26,22 @@ test("renderer follows Primer and canvas theme tokens with system color-scheme f
   assert.match(STYLES, /\.update-ready\[hidden\] \{ display: none; \}/);
   assert.match(STYLES, /\.live-tooltip::after \{[\s\S]*?content: attr\(data-tooltip\)/);
   assert.match(STYLES, /\.live-tooltip:hover::after, \.live-tooltip:focus-visible::after/);
+});
+
+test("theme honors explicit light/dark selection and falls back to the system", () => {
+  for (const [search, dark, expected] of [
+    ["?clawpilotTheme=light", true, "light"],
+    ["?clawpilotTheme=dark", false, "dark"],
+    ["", true, "dark"], ["", false, "light"], ["?clawpilotTheme=invalid", false, "light"],
+  ]) {
+    let actual;
+    vm.runInNewContext(THEME_JS, {
+      URLSearchParams,
+      window: { location: { search }, matchMedia: () => ({ matches: dark }) },
+      document: { documentElement: { setAttribute: (key, value) => { assert.equal(key, "data-theme"); actual = value; } } },
+    });
+    assert.equal(actual, expected);
+  }
 });
 
 test("render keeps the current dashboard visible and surfaces later load errors", () => {
@@ -47,47 +59,6 @@ test("render keeps the current dashboard visible and surfaces later load errors"
 
   assert.match(app.innerHTML, /GitHub API 500 unavailable/);
   assert.match(app.innerHTML, /GitHub accounts/);
-});
-
-test("deleteRepo completes once when both the animation and fallback timeout fire", () => {
-  const row = {
-    classList: { add() {} },
-    addEventListener(_event, handler) { this.animationEnd = handler; },
-  };
-  const timers = [];
-  const { api } = createRendererHarness({ setTimeout: (handler) => { timers.push(handler); return timers.length; } });
-  api.draftReposByAcct["acct:github.com/octo"] = ["microsoft/aspire", "microsoft/dcp", "microsoft/aspire.dev"];
-
-  api.deleteRepo("acct:github.com/octo", 0, row);
-  row.animationEnd();
-  for (const timer of timers) timer();
-
-  assert.deepEqual(api.draftReposByAcct["acct:github.com/octo"], ["microsoft/dcp", "microsoft/aspire.dev"]);
-});
-
-test("failed repo saves show the API error and revert the optimistic draft", async () => {
-  const id = "acct:github.com/octo";
-  const previousRepos = ["microsoft/aspire"];
-  const errEl = errorElement();
-  const { api } = createRendererHarness({
-    fetch: async (url) => {
-      if (String(url) === "api/account/repos") {
-        return jsonResponse({ error: "GitHub API 500 unavailable" }, { ok: false, status: 500 });
-      }
-      return new Promise(() => {});
-    },
-    querySelector(selector) {
-      return selector === '.repo-err[data-err="acct\\:github\\.com\\/octo"]' ? errEl : null;
-    },
-  });
-  api.draftReposByAcct[id] = ["microsoft/aspire", "microsoft/dcp"];
-  api.editingByAcct[id] = -1;
-
-  await api.persistAccountRepos(id, previousRepos);
-
-  assert.deepEqual(api.draftReposByAcct[id], previousRepos);
-  assert.equal(errEl.textContent, "Couldn't save repositories: GitHub API 500 unavailable");
-  assert.equal(errEl.classList.has("show"), true);
 });
 
 test("forYouCardActions maps pick labels (and layered signals) to actions", () => {
@@ -405,29 +376,9 @@ test("load suppresses its failure when a newer revision was applied while the GE
   assert.equal(api.getState().marker, "fresh");
 });
 
-test("persistAccountRepos ignores a stale save response so it can't roll lastAppliedSeq back", async () => {
-  // The save response's dashboard must be seq-gated like every adoption path: a save that resolves
-  // after a newer refresh/SSE snapshot already applied must not roll state/lastAppliedSeq backward.
-  const staleSave = { dashboard: { seq: 4, marker: "stale-save", authenticated: false, accounts: [], message: "" }, prefs: {} };
-  const { api } = createRendererHarness({
-    fetch: async (url) => String(url) === "api/account/repos" ? jsonResponse(staleSave) : new Promise(() => {}),
-  });
-
-  // Establish a newer applied revision (seq 9). withRefresh takes its data from fn, not fetch.
-  await api.withRefresh(async () => ({ dashboard: { seq: 9, marker: "fresh", authenticated: false, accounts: [], message: "" }, prefs: {} }));
-  assert.equal(api.getAppliedSeq(), 9);
-
-  // A repo save whose response carries an older seq (4) must be gated out — no rollback.
-  api.draftReposByAcct["acct1"] = ["owner/repo"];
-  await api.persistAccountRepos("acct1", []);
-  assert.equal(api.getState().marker, "fresh");
-  assert.equal(api.getAppliedSeq(), 9);
-});
-
-test("rescanAccounts ignores a stale /api/accounts response so it can't roll lastAppliedSeq back", async () => {
-  // The rescan response must be seq-gated too: if a newer refresh/SSE snapshot applied while the
-  // rescan was in flight, adopting its older dashboard would roll state/lastAppliedSeq backward.
-  const staleRescan = { dashboard: { seq: 4, marker: "stale-rescan", authenticated: false, accounts: [], message: "" }, prefs: {} };
+test("rescanAccounts discovers credential metadata without replacing dashboard or preferences", async () => {
+  const account = { id: "acct:github.com/octo", login: "octo", host: "github.com", status: "ok" };
+  const staleRescan = { accounts: [account] };
   const { api } = createRendererHarness({
     fetch: async (url) => String(url) === "api/accounts" ? jsonResponse(staleRescan) : new Promise(() => {}),
   });
@@ -436,8 +387,9 @@ test("rescanAccounts ignores a stale /api/accounts response so it can't roll las
   await api.withRefresh(async () => ({ dashboard: { seq: 9, marker: "fresh", authenticated: false, accounts: [], message: "" }, prefs: {} }));
   assert.equal(api.getAppliedSeq(), 9);
 
-  // A rescan whose response carries an older seq (4) must be gated out — no rollback.
+  // Discovery is separate from dashboard state and never changes its revision.
   await api.rescanAccounts();
+  assert.equal(api.currentAccounts()[0].login, "octo");
   assert.equal(api.getState().marker, "fresh");
   assert.equal(api.getAppliedSeq(), 9);
 });
@@ -882,7 +834,7 @@ test("Health mode renders provider evidence and remains available without GitHub
   assert.doesNotMatch(app.innerHTML, /No GitHub credentials detected/);
   assert.match(STYLES, /\.health-card:hover \{[\s\S]*?translateY\(-1px\)/);
   assert.match(STYLES, /\.health-unit\.dragging \{[\s\S]*?rotate\(\.35deg\)/);
-  assert.match(STYLES, /\.health-drag-ghost \{[\s\S]*?var\(--shadow-floating\)/);
+  assert.match(STYLES, /\.health-drag-ghost \{[\s\S]*?var\(--cp-shadow\)/);
   assert.match(STYLES, /\.health-details\[open\] \.health-details-chevron \{ transform: rotate\(180deg\); \}/);
   assert.match(STYLES, /prefers-reduced-motion: reduce[\s\S]*?\.health-unit\.dragging/);
   assert.match(STYLES, /@media \(max-width: 470px\)[\s\S]*?button\.brand \{ display: none; \}[\s\S]*?#filters-btn \{ display: none; \}/);
@@ -1383,6 +1335,525 @@ function rendererPrefs() {
   };
 }
 
+const repositoryA = { id: "github.com/octo/alpha", host: "github.com", repository: "Octo/Alpha", accountId: "acct:github.com/octo" };
+const repositoryB = { id: "ghe.example.com/team/beta", host: "ghe.example.com", repository: "Team/Beta", accountId: "acct:ghe.example.com/octo" };
+function repositoryPayload(repo = repositoryA, seq = 1, overrides = {}) {
+  return {
+    prefs: { ...rendererPrefs(), repositories: [repositoryA, repositoryB], selectedRepository: repo?.id || "", release: "", teamMembers: [] },
+    dashboard: {
+      ...healthDashboard([], emptyHealthCounts(), true),
+      repositoryId: repo?.id || "", seq, marker: repo?.repository || "empty",
+      cacheStatus: "cached", refreshing: true, ...overrides,
+    },
+  };
+}
+function seedRepository(api, repo = repositoryA) {
+  const data = repositoryPayload(repo);
+  api.setPrefs(data.prefs);
+  api.setState(data.dashboard);
+}
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+function formElement(value = "", checked = false) {
+  return { value, checked, addEventListener() {}, classList: classList(), setAttribute() {} };
+}
+
+test("project picker and repository management remain available before load, unauthenticated, and after failure", () => {
+  const { app, api } = createRendererHarness({ fetch: () => new Promise(() => {}) });
+  for (const state of [null, { authenticated: false, accounts: [], message: "" }]) {
+    api.setState(state);
+    api.render();
+    assert.match(app.innerHTML, /id="repository-picker"/);
+    assert.match(app.innerHTML, /id="repositories-btn"/);
+    assert.match(app.innerHTML, /No repository selected/);
+  }
+  api.setState(null);
+  api.setLoadError("Offline");
+  api.render();
+  assert.match(app.innerHTML, /Could not load/);
+  assert.match(app.innerHTML, /id="repositories-btn"/);
+  api.goView("repositories");
+  assert.match(app.innerHTML, /<h2>Repositories/);
+  assert.match(app.innerHTML, /Manage accounts/);
+});
+
+test("accounts no longer edit repositories, and the repositories page preserves canonical host identity", () => {
+  const { app, api } = createRendererHarness();
+  seedRepository(api);
+  api.setView("accounts");
+  api.render();
+  assert.doesNotMatch(app.innerHTML, /repo-add-input|data-addinput/);
+  assert.doesNotMatch(APP_JS, /api\/account\/repos/);
+  api.setView("repositories");
+  api.render();
+  assert.match(app.innerHTML, /value="ghe.example.com\/team\/beta"/);
+  assert.match(app.innerHTML, /Team\/Beta \(ghe.example.com\)/);
+  assert.match(app.innerHTML, /acct:ghe.example.com\/octo/);
+  assert.match(app.innerHTML, /data-repository-remove="github.com\/octo\/alpha"/);
+  assert.match(app.innerHTML, /<select id="repository-account">/);
+  assert.doesNotMatch(app.innerHTML, /<input[^>]*(?:id|name)="[^"]*host/i);
+});
+
+test("empty selection cannot clear the picker or contradict an existing repository dashboard", async () => {
+  const requests = [];
+  const handlers = {};
+  const picker = {
+    ...formElement(repositoryA.id),
+    addEventListener(event, handler) { handlers[event] = handler; },
+  };
+  const { app, api } = createRendererHarness({
+    elements: { "repository-picker": picker },
+    fetch: path => { requests.push(path); return new Promise(() => {}); },
+  });
+  seedRepository(api);
+  api.render();
+  assert.match(app.innerHTML, /<option value="" disabled>No repository selected<\/option>/);
+  const dashboard = api.getState();
+  const preferences = api.getPrefs();
+  picker.value = "";
+  await handlers.change();
+  assert.equal(picker.value, repositoryA.id);
+  assert.equal(api.getState(), dashboard);
+  assert.equal(api.getPrefs(), preferences);
+  assert.match(app.innerHTML, /value="github.com\/octo\/alpha" selected/);
+  assert.match(app.innerHTML, /Choose a repository from the list/);
+  assert.ok(!requests.includes("api/repositories/select"));
+});
+
+test("empty startup keeps its placeholder selected without posting an empty selection", async () => {
+  const requests = [];
+  const { app, api } = createRendererHarness({
+    fetch: path => { requests.push(path); return new Promise(() => {}); },
+  });
+  seedRepository(api, null);
+  api.render();
+  assert.match(app.innerHTML, /<option value="" selected>No repository selected<\/option>/);
+  await api.selectRepository("");
+  assert.equal(api.getPrefs().selectedRepository, "");
+  assert.equal(api.getLoadError(), null);
+  assert.ok(!requests.includes("api/repositories/select"));
+});
+
+test("repository switching clears old content immediately, applies cache, then accepts only matching SSE", async () => {
+  const request = deferred();
+  const { app, api } = createRendererHarness({
+    fetch: (path) => path === "api/repositories/select" ? request.promise : new Promise(() => {}),
+  });
+  seedRepository(api);
+  const selecting = api.selectRepository(repositoryB.id);
+  assert.equal(api.getState().repositoryId, repositoryB.id);
+  assert.equal(api.getState().health, undefined);
+  assert.match(app.innerHTML, /Loading repository/);
+  api.applyPushedState(repositoryPayload(repositoryA, 999));
+  assert.equal(api.getState().repositoryId, repositoryB.id);
+  request.resolve(jsonResponse(repositoryPayload(repositoryB, 2)));
+  await selecting;
+  assert.equal(api.getState().marker, repositoryB.repository);
+  assert.match(app.innerHTML, /Cached data/);
+  api.applyPushedState(repositoryPayload(repositoryB, 3, { cacheStatus: "live", refreshing: false }));
+  assert.match(app.innerHTML, /Live data/);
+  assert.doesNotMatch(app.innerHTML, /Refreshing\.\.\./);
+});
+
+test("A then B selection serializes server writes and ignores late A responses and errors", async () => {
+  for (const failA of [false, true]) {
+    const first = deferred(), second = deferred();
+    const calls = [];
+    const { api } = createRendererHarness({
+      fetch: (path, options) => {
+        if (path !== "api/repositories/select") return new Promise(() => {});
+        calls.push(JSON.parse(options.body).id);
+        return calls.length === 1 ? first.promise : second.promise;
+      },
+    });
+    seedRepository(api);
+    const a = api.selectRepository(repositoryA.id);
+    await Promise.resolve();
+    const b = api.selectRepository(repositoryB.id);
+    assert.deepEqual(calls, [repositoryA.id]);
+    if (failA) first.reject(new Error("Old A failure"));
+    else first.resolve(jsonResponse(repositoryPayload(repositoryA, 800)));
+    await a;
+    await Promise.resolve();
+    assert.deepEqual(calls, [repositoryA.id, repositoryB.id]);
+    assert.equal(api.getState().repositoryId, repositoryB.id);
+    assert.equal(api.getLoadError(), null);
+    second.resolve(jsonResponse(repositoryPayload(repositoryB, 2)));
+    await b;
+    assert.equal(api.getPrefs().selectedRepository, repositoryB.id);
+    assert.equal(api.getState().seq, 2);
+  }
+});
+
+test("old loads, refresh responses, and pending form snapshots cannot overwrite a new repository", async () => {
+  const oldLoad = deferred(), oldRefresh = deferred();
+  const { api } = createRendererHarness({
+    fetch: (path) => path === "api/repositories/select"
+      ? Promise.resolve(jsonResponse(repositoryPayload(repositoryB, 2))) : oldLoad.promise,
+  });
+  seedRepository(api);
+  const loading = api.load();
+  const refreshing = api.withRefresh(() => oldRefresh.promise);
+  api.setView("settings");
+  api.applyPushedState(repositoryPayload(repositoryA, 999));
+  await api.selectRepository(repositoryB.id);
+  oldLoad.resolve(jsonResponse(repositoryPayload(repositoryA, 1000)));
+  oldRefresh.resolve(repositoryPayload(repositoryA, 1001));
+  await Promise.all([loading, refreshing]);
+  api.goView("queue");
+  assert.equal(api.getState().repositoryId, repositoryB.id);
+  assert.equal(api.getState().seq, 2);
+  api.onPreferences(repositoryPayload(repositoryA).prefs);
+  api.onSnapshot({ seq: 2000, repositoryId: repositoryA.id, prefs: repositoryPayload(repositoryA).prefs });
+  api.onUpdateAvailable({ seq: 2000, repositoryId: repositoryA.id });
+  assert.equal(api.getPrefs().selectedRepository, repositoryB.id);
+  assert.equal(api.getUpdateAvailable(), null);
+});
+
+test("pending SSE snapshots retain the newest matching revision while editing", () => {
+  const { api } = createRendererHarness();
+  seedRepository(api);
+  api.setView("repositories");
+  api.applyPushedState(repositoryPayload(repositoryA, 5));
+  api.applyPushedState(repositoryPayload(repositoryA, 3));
+  api.applyPushedState(repositoryPayload(repositoryB, 100));
+  api.goView("queue");
+  assert.equal(api.getState().seq, 5);
+  assert.equal(api.getState().repositoryId, repositoryA.id);
+});
+
+test("failed selection surfaces an error without restoring the previous repository's dashboard", async () => {
+  const { app, api } = createRendererHarness({
+    fetch: (path) => path === "api/repositories/select"
+      ? Promise.resolve(jsonResponse({ error: "Access denied" }, { ok: false, status: 403 })) : new Promise(() => {}),
+  });
+  seedRepository(api);
+  await api.selectRepository(repositoryB.id);
+  assert.match(app.innerHTML, /Could not select repository: Access denied/);
+  assert.equal(api.getState().repositoryId, repositoryB.id);
+  assert.equal(api.getState().refreshing, false);
+  assert.equal(api.getState().marker, undefined);
+});
+
+test("cached content remains visible alongside freshness and refresh errors", () => {
+  const { app, api } = createRendererHarness();
+  const data = repositoryPayload(repositoryA, 1, {
+    refreshError: "GitHub rate limit <exceeded>",
+    health: { items: [{ id: "health-a", repository: repositoryA.repository, name: "Retained result", state: "healthy", provider: "github" }], counts: {} },
+  });
+  api.setState(data.dashboard);
+  api.setPrefs(data.prefs);
+  api.render();
+  assert.match(app.innerHTML, /Retained result/);
+  assert.match(app.innerHTML, /Cached data.*Updated.*Refreshing/);
+  assert.match(app.innerHTML, /Refresh failed: GitHub rate limit &lt;exceeded&gt;/);
+});
+
+test("empty startup reports no repository selected instead of loading, including unauthenticated views", () => {
+  const { app, api } = createRendererHarness();
+  for (const authenticated of [false, true]) {
+    for (const cacheStatus of ["empty", ""]) {
+      for (const mode of ["review", "health"]) {
+        const data = repositoryPayload(null, 1, {
+          authenticated, mode, cacheStatus, loading: false, refreshing: false, fetchedAt: null,
+        });
+        api.setState(data.dashboard);
+        api.setPrefs(data.prefs);
+        api.render();
+        assert.match(app.innerHTML, /class="freshness" role="status">No repository selected<\/div>/);
+        assert.doesNotMatch(app.innerHTML, /Loading data|Loading repository|Refreshing\.\.\.|Updated null/);
+        assert.match(app.innerHTML, /id="repositories-btn"/);
+      }
+    }
+  }
+});
+
+test("selected repository with no cache and no active request does not claim to be loading", () => {
+  const { app, api } = createRendererHarness();
+  const data = repositoryPayload(repositoryA, 1, {
+    cacheStatus: "empty", loading: false, refreshing: false, fetchedAt: null,
+  });
+  api.setState(data.dashboard);
+  api.setPrefs(data.prefs);
+  api.render();
+  assert.match(app.innerHTML, /class="freshness" role="status">No data available<\/div>/);
+  assert.doesNotMatch(app.innerHTML, /Loading data/);
+});
+
+test("search debounce cancels superseded queries and ignores late results after account or view changes", async () => {
+  const timers = new Map();
+  let timerId = 0;
+  const requests = [];
+  const { api } = createRendererHarness({
+    setTimeout: (callback) => { timers.set(++timerId, callback); return timerId; },
+    clearTimeout: id => timers.delete(id),
+    fetch: (path, options) => {
+      if (!path.startsWith("api/repositories/search")) return new Promise(() => {});
+      const response = deferred();
+      requests.push({ path, options, response });
+      return response.promise;
+    },
+  });
+  seedRepository(api);
+  api.setView("repositories");
+  api.scheduleRepositorySearch(repositoryA.accountId, "old");
+  api.scheduleRepositorySearch(repositoryA.accountId, "new & query");
+  assert.equal(timers.size, 1);
+  const searchingA = [...timers.values()][0]();
+  assert.match(requests[0].path, /q=new%20%26%20query/);
+  assert.deepEqual(Object.fromEntries(new URL(requests[0].path, "http://localhost/").searchParams),
+    { accountId: repositoryA.accountId, q: "new & query" });
+  api.scheduleRepositorySearch(repositoryB.accountId, "beta");
+  assert.equal(requests[0].options.signal.aborted, true);
+  const searchingB = [...timers.values()].at(-1)();
+  assert.deepEqual(Object.fromEntries(new URL(requests[1].path, "http://localhost/").searchParams),
+    { accountId: repositoryB.accountId, q: "beta" });
+  requests[1].response.resolve(jsonResponse({ items: [{ repository: "Team/Beta", description: "<script>", private: true }] }));
+  await searchingB;
+  requests[0].response.resolve(jsonResponse({ items: [{ repository: "Old/Result" }] }));
+  await searchingA;
+  assert.match(api.repositoriesView(), /Team\/Beta/);
+  assert.match(api.repositoriesView(), /&lt;script&gt;/);
+  assert.doesNotMatch(api.repositoriesView(), /Old\/Result/);
+  api.scheduleRepositorySearch(repositoryB.accountId, "leaving");
+  const leaving = [...timers.values()].at(-1)();
+  api.goView("accounts");
+  requests[2].response.resolve(jsonResponse({ items: [{ repository: "Late/Result" }] }));
+  await leaving;
+  assert.doesNotMatch(api.repositoriesView(), /Late\/Result/);
+});
+
+test("search errors and empty results are explicit and do not remove saved repositories", async () => {
+  for (const response of [{ items: [], error: "Search unavailable" }, { items: [] }]) {
+    const { api } = createRendererHarness({
+      fetch: path => path.startsWith("api/repositories/search")
+        ? Promise.resolve(jsonResponse(response)) : new Promise(() => {}),
+    });
+    seedRepository(api);
+    api.scheduleRepositorySearch(repositoryA.accountId, "missing");
+    await new Promise(resolve => setImmediate(resolve));
+    assert.match(api.repositoriesView(), response.error ? /Search unavailable/ : /No matching repositories/);
+    assert.equal(api.getPrefs().repositories.length, 2);
+  }
+});
+
+test("repository add/remove use their dedicated API contracts and preserve state on failure", async () => {
+  const calls = [];
+  let fail = true;
+  const { api } = createRendererHarness({
+    setTimeout: () => 1,
+    fetch: (path, options) => {
+      if (!path.startsWith("api/repositories/")) return new Promise(() => {});
+      calls.push({ path, body: JSON.parse(options.body) });
+      return Promise.resolve(fail
+        ? jsonResponse({ error: "Repository not accessible" }, { ok: false, status: 400 })
+        : jsonResponse(repositoryPayload(null, 5)));
+    },
+  });
+  seedRepository(api);
+  api.setView("repositories");
+  api.scheduleRepositorySearch(repositoryA.accountId, "Octo/New");
+  await api.mutateRepository("add", "Octo/New");
+  assert.deepEqual(calls[0], { path: "api/repositories/add", body: { accountId: repositoryA.accountId, repository: "Octo/New" } });
+  assert.match(api.repositoriesView(), /Repository not accessible/);
+  assert.equal(api.getPrefs().selectedRepository, repositoryA.id);
+  fail = false;
+  await api.mutateRepository("remove", repositoryA.id);
+  assert.deepEqual(calls[1], { path: "api/repositories/remove", body: { id: repositoryA.id } });
+  assert.equal(api.getPrefs().selectedRepository, "");
+  assert.equal(api.getState().repositoryId, "");
+});
+
+test("settings send an empty release and configurable team text and preserve both across auxiliary forms", async () => {
+  const elements = {
+    "release-input": formElement(""),
+    "team-members-input": formElement("octo\nhubot"),
+    "s-drafts": formElement("", true),
+    "n-review": formElement("", true), "n-ready": formElement(), "n-changes": formElement(), "n-ci": formElement(),
+  };
+  let body;
+  const { api } = createRendererHarness({
+    elements,
+    fetch: (path, options) => {
+      if (path !== "api/prefs") return new Promise(() => {});
+      body = JSON.parse(options.body);
+      return Promise.resolve(jsonResponse(repositoryPayload(repositoryA, 5)));
+    },
+  });
+  seedRepository(api);
+  const draft = api.captureSettingsDraft();
+  elements["team-members-input"].value = "discarded";
+  api.restoreSettingsDraft(draft);
+  assert.equal(elements["team-members-input"].value, "octo\nhubot");
+  assert.match(api.settingsView(), /Leave empty for no release filter/);
+  assert.doesNotMatch(api.settingsView(), /13\.5|microsoft\/aspire/);
+  await api.saveSettings();
+  assert.equal(body.release, "");
+  assert.equal(body.teamMembers, "octo\nhubot");
+  assert.equal(body.showDrafts, true);
+});
+
+test("standalone doctor and session configuration retain their endpoints and generic defaults", async () => {
+  const elements = {
+    "release-input": formElement(""), "team-members-input": formElement("octo"),
+    "s-drafts": formElement(), "n-review": formElement(), "n-ready": formElement(), "n-changes": formElement(), "n-ci": formElement(),
+    "session-project": formElement(""), "session-project-name": formElement("Alpha"),
+    "session-project-url": formElement("https://github.com/Octo/Alpha"),
+  };
+  const calls = [];
+  const { app, api } = createRendererHarness({
+    standalone: true, elements,
+    fetch: (path, options) => {
+      calls.push({ path, body: options?.body ? JSON.parse(options.body) : null });
+      if (path === "api/doctor") return Promise.resolve(jsonResponse({ checks: [{ status: "ok", label: "GitHub CLI", message: "Available" }] }));
+      if (path === "api/session/configuration") return Promise.resolve(jsonResponse({ ok: true }));
+      return Promise.resolve(jsonResponse(repositoryPayload(repositoryA, 2)));
+    },
+  });
+  seedRepository(api);
+  api.setView("settings");
+  await api.runDoctor();
+  assert.match(app.innerHTML, /GitHub CLI/);
+  assert.equal(elements["team-members-input"].value, "octo");
+  await api.saveSessionProject("add");
+  assert.deepEqual(calls.find(c => c.path === "api/session/configuration").body, {
+    projects: [{ name: "Alpha", repositoryUrl: "https://github.com/Octo/Alpha" }], selectedRepositoryUrl: "",
+  });
+});
+
+test("credential discovery runs on first management visit even when the cached dashboard has no accounts", async () => {
+  const calls = [];
+  const { app, api } = createRendererHarness({
+    fetch: path => {
+      calls.push(path);
+      if (path === "api/accounts") return Promise.resolve(jsonResponse({ accounts: [
+        { id: repositoryA.accountId, login: "octo", host: "github.com", status: "ok" },
+      ] }));
+      return new Promise(() => {});
+    },
+  });
+  await api.withRefresh(async () => repositoryPayload(repositoryA));
+  api.goView("repositories");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(calls.includes("api/accounts"));
+  assert.match(app.innerHTML, /octo \(github.com\)/);
+  assert.doesNotMatch(app.innerHTML, /undefined\/undefined/);
+});
+
+test("out-of-order credential scans only publish the newest metadata", async () => {
+  const scans = [];
+  const { api } = createRendererHarness({
+    fetch: path => {
+      if (path !== "api/accounts") return new Promise(() => {});
+      const scan = deferred();
+      scans.push(scan);
+      return scan.promise;
+    },
+  });
+  seedRepository(api);
+  const first = api.rescanAccounts();
+  const second = api.rescanAccounts();
+  scans[1].resolve(jsonResponse({ accounts: [{ id: repositoryB.accountId, login: "new" }] }));
+  await second;
+  scans[0].resolve(jsonResponse({ accounts: [{ id: repositoryA.accountId, login: "old" }] }));
+  await first;
+  assert.equal(api.currentAccounts()[0].login, "new");
+  assert.equal(api.getState().repositoryId, repositoryA.id);
+});
+
+test("adding the first repository adopts the server selection and duplicate clicks send one request", async () => {
+  const addition = deferred();
+  let additions = 0;
+  const { api } = createRendererHarness({
+    setTimeout: () => 1,
+    fetch: path => {
+      if (path !== "api/repositories/add") return new Promise(() => {});
+      additions++;
+      return addition.promise;
+    },
+  });
+  seedRepository(api, null);
+  api.setView("repositories");
+  api.scheduleRepositorySearch(repositoryA.accountId, repositoryA.repository);
+  const first = api.mutateRepository("add", repositoryA.repository);
+  await api.mutateRepository("add", repositoryA.repository);
+  assert.equal(additions, 1);
+  addition.resolve(jsonResponse(repositoryPayload(repositoryA)));
+  await first;
+  assert.equal(api.getPrefs().selectedRepository, repositoryA.id);
+  assert.equal(api.getState().repositoryId, repositoryA.id);
+});
+
+test("a late Apply update response is ignored after repository selection", async () => {
+  const update = deferred();
+  const { api } = createRendererHarness({
+    fetch: path => path === "api/repositories/select"
+      ? Promise.resolve(jsonResponse(repositoryPayload(repositoryB, 2))) : update.promise,
+  });
+  seedRepository(api);
+  api.onUpdateAvailable({ repositoryId: repositoryA.id, seq: 10 });
+  const applying = api.applyAvailableUpdate();
+  await api.selectRepository(repositoryB.id);
+  update.resolve(jsonResponse(repositoryPayload(repositoryA, 10)));
+  await applying;
+  assert.equal(api.getState().repositoryId, repositoryB.id);
+  assert.equal(api.getPrefs().selectedRepository, repositoryB.id);
+});
+
+test("all dashboard modes preserve the same selected repository and header management", () => {
+  const { app, api } = createRendererHarness();
+  for (const mode of ["review", "issues", "ship", "health"]) {
+    const data = repositoryPayload(repositoryB, 1, { mode });
+    api.setState(data.dashboard);
+    api.setPrefs(data.prefs);
+    api.render();
+    assert.match(app.innerHTML, /value="ghe.example.com\/team\/beta" selected/);
+    assert.match(app.innerHTML, /id="repositories-btn"/);
+    assert.equal(api.getState().repositoryId, repositoryB.id);
+  }
+});
+
+test("pipeline settings list only the selected repository's configured sources", () => {
+  const { api } = createRendererHarness();
+  const pipelines = [
+    { id: "pipeline-a", name: "Alpha delivery", repositoryId: repositoryA.id, url: "https://dev.azure.com/org/a/_build?definitionId=1" },
+    { id: "pipeline-b", name: "Beta delivery", repositoryId: repositoryB.id, url: "https://dev.azure.com/org/b/_build?definitionId=2" },
+    { id: "unassigned", name: "Unassigned delivery", url: "https://dev.azure.com/org/c/_build?definitionId=3" },
+  ];
+  for (const [repo, shown, hidden] of [
+    [repositoryA, "Alpha delivery", "Beta delivery"],
+    [repositoryB, "Beta delivery", "Alpha delivery"],
+  ]) {
+    api.setPrefs({ ...repositoryPayload(repo).prefs, azurePipelines: pipelines });
+    const html = api.pipelineEditorHtml();
+    assert.ok(html.includes(shown));
+    assert.ok(!html.includes(hidden));
+    assert.doesNotMatch(html, /Unassigned delivery|auto-discovered|CLI default project|additional definitions/);
+    assert.match(html, /Pipelines are assigned to the selected repository/);
+  }
+  api.setPrefs({ ...repositoryPayload(null).prefs, azurePipelines: pipelines });
+  const empty = api.pipelineEditorHtml();
+  assert.match(empty, /No pipelines configured for this repository/);
+  assert.match(empty, /id="pipeline-add-btn"[^>]*disabled/);
+  assert.doesNotMatch(empty, /Alpha delivery|Beta delivery|Unassigned delivery/);
+});
+
+test("pipeline mutations without a repository show a validation error instead of sending a global change", async () => {
+  const requests = [];
+  const { api } = createRendererHarness({
+    fetch: path => { requests.push(path); return new Promise(() => {}); },
+  });
+  seedRepository(api, null);
+  api.setView("settings");
+  api.setPipelineDrafts("https://dev.azure.com/org/project/_build?definitionId=1", "");
+  await api.addAzurePipeline();
+  assert.equal(requests.filter(path => path.startsWith("api/health/pipeline/")).length, 0);
+  assert.equal(api.getPipelineDrafts().error, "Select a repository before configuring pipelines.");
+});
+
 function emptyHealthCounts() {
   return { total: 0, healthy: 0, running: 0, degraded: 0, failing: 0, unavailable: 0, unknown: 0 };
 }
@@ -1423,7 +1894,7 @@ function createRendererHarness(overrides = {}) {
   };
   const sandbox = {
     document,
-    window: { CSS: { escape: cssEscape }, aspireTeamStandalone: !!overrides.standalone },
+    window: { CSS: { escape: cssEscape }, githubTeamStandalone: !!overrides.standalone },
     crypto: { randomUUID: () => "b3a61b14-b22c-426e-9a4b-495606e2bc3a" },
     CSS: { escape: cssEscape },
     EventSource: function () { throw new Error("disabled"); },
@@ -1433,12 +1904,13 @@ function createRendererHarness(overrides = {}) {
     setTimeout: overrides.setTimeout ?? ((handler) => { handler(); return 1; }),
     clearTimeout: overrides.clearTimeout ?? (() => {}),
     URL,
+    AbortController,
     setInterval: overrides.setInterval ?? (() => 1),
     clearInterval: overrides.clearInterval ?? (() => {}),
     console,
   };
 
-  vm.runInNewContext(`${APP_JS}\n;globalThis.__test = {\n  render,\n  withRefresh,\n  load,\n  rescanAccounts,\n  onCardAction,\n  applyPushedState,\n  onUpdateAvailable,\n  onPreferences,\n  onSnapshot,\n  onPollSchedule,\n  applyAvailableUpdate,\n  toggleAutoApply,\n  autoApplyEnabled,\n  openLinkedPr,\n  deleteRepo,\n  persistAccountRepos,\n  draftReposByAcct,\n  editingByAcct,\n  forYouCardActions,\n  focusCardActions,\n  laneCardActions,\n  signalActions,\n  mergeActions,\n  queuePanel,\n  cardActionBtn,\n  issueCard,\n  healthCard,\n  healthView,\n  healthRepositoryGroups,\n  pipelineEditorHtml,\n  addAzurePipeline,\n  removeAzurePipeline,\n  commitHealthOrder,\n  moveHealthSource,\n  dropHealthSource,\n  setHealthDropMarker,\n  wireHealthOrdering,\n  actionKey,\n  inflightActions,\n  setProgress,\n  setState(value) { state = value; },\n  getState() { return state; },\n  getAppliedSeq() { return lastAppliedSeq; },\n  getUpdateAvailable() { return updateAvailable; },\n  setPrefs(value) { prefs = value; },\n  getPrefs() { return prefs; },\n  setHealthOrderSaving(value) { healthOrderSaving = !!value; },\n  setPipelineDrafts(url, branch) { pipelineUrlDraft = url; pipelineBranchDraft = branch; },\n  getPipelineDrafts() { return { url: pipelineUrlDraft, branch: pipelineBranchDraft, error: pipelineError }; },\n  setView(value) { view = value; },\n  setRefreshing(value) { refreshing = !!value; },\n  setRefreshInFlight(value) { refreshInFlight = value; },\n  setLoadError(value) { loadError = value; },\n  getLoadError() { return loadError; },\n};`, sandbox);
+  vm.runInNewContext(`${APP_JS}\n;globalThis.__test = {\n  render,\n  withRefresh,\n  load,\n  rescanAccounts,\n  onCardAction,\n  applyPushedState,\n  onUpdateAvailable,\n  onPreferences,\n  onSnapshot,\n  onPollSchedule,\n  applyAvailableUpdate,\n  toggleAutoApply,\n  autoApplyEnabled,\n  openLinkedPr,\n  selectRepository,\n  mutateRepository,\n  scheduleRepositorySearch,\n  searchRepositories,\n  repositoriesView,\n  currentAccounts,\n  goView,\n  saveSettings,\n  runDoctor,\n  saveSessionProject,\n  settingsView,\n  captureSettingsDraft,\n  restoreSettingsDraft,\n  forYouCardActions,\n  focusCardActions,\n  laneCardActions,\n  signalActions,\n  mergeActions,\n  queuePanel,\n  cardActionBtn,\n  issueCard,\n  healthCard,\n  healthView,\n  healthRepositoryGroups,\n  pipelineEditorHtml,\n  addAzurePipeline,\n  removeAzurePipeline,\n  commitHealthOrder,\n  moveHealthSource,\n  dropHealthSource,\n  setHealthDropMarker,\n  wireHealthOrdering,\n  actionKey,\n  inflightActions,\n  setProgress,\n  setState(value) { state = value; },\n  getState() { return state; },\n  getAppliedSeq() { return lastAppliedSeq; },\n  getUpdateAvailable() { return updateAvailable; },\n  setPrefs(value) { prefs = value; },\n  getPrefs() { return prefs; },\n  setHealthOrderSaving(value) { healthOrderSaving = !!value; },\n  setPipelineDrafts(url, branch) { pipelineUrlDraft = url; pipelineBranchDraft = branch; },\n  getPipelineDrafts() { return { url: pipelineUrlDraft, branch: pipelineBranchDraft, error: pipelineError }; },\n  setView(value) { view = value; },\n  setRefreshing(value) { refreshing = !!value; },\n  setRefreshInFlight(value) { refreshInFlight = value; },\n  setLoadError(value) { loadError = value; },\n  getLoadError() { return loadError; },\n};`, sandbox);
 
   return { app, api: sandbox.__test };
 }
@@ -1550,8 +2022,13 @@ test("standalone requests identify their browser tab", async () => {
       return jsonResponse({ dashboard: healthDashboard([], emptyHealthCounts(), false), prefs: rendererPrefs() });
     },
   });
+  await api.load();
+  assert.ok(requests.length > 0);
+  assert.deepEqual(requests.map(request => request.options.headers["X-Team-App-Client"]),
+    requests.map(() => "b3a61b14-b22c-426e-9a4b-495606e2bc3a"));
+});
 
-  test("standalone actions prepare an explicit local app link without launching a session", async () => {
+test("standalone actions prepare an explicit local app link without launching a session", async () => {
     const appUrl = "ghapp://session/new?repo=microsoft%2Faspire&pr=123&mode=interactive";
     let replacement;
     const button = {
@@ -1575,9 +2052,4 @@ test("standalone requests identify their browser tab", async () => {
     assert.equal(replacement.textContent, "Open in GitHub App");
     assert.equal(replacement.title, "Review and confirm the new session in GitHub App");
     assert.equal(api.inflightActions.size, 0);
-  });
-  await api.load();
-  assert.ok(requests.length > 0);
-  assert.deepEqual(requests.map(request => request.options.headers["X-Team-App-Client"]),
-    requests.map(() => "b3a61b14-b22c-426e-9a4b-495606e2bc3a"));
 });

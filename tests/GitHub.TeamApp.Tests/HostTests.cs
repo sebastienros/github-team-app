@@ -5,7 +5,7 @@ using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Http;
 using Xunit;
 
-namespace Aspire.TeamApp.Tests;
+namespace GitHub.TeamApp.Tests;
 
 public class HostTests
 {

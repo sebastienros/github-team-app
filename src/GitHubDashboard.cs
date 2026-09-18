@@ -4,7 +4,7 @@
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
-namespace Aspire.TeamApp;
+namespace GitHub.TeamApp;
 
 internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> logger)
 {
@@ -13,7 +13,7 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
 
     public async Task<JsonObject> LoadAsync(IReadOnlyList<Account> accounts, JsonObject prefs, CancellationToken ct)
     {
-        var usable = accounts.Where(account => account.Token.Length > 0 && account.Login.Length > 0).ToArray();
+        var usable = accounts.Where(account => account.Active && account.Token.Length > 0 && account.Login.Length > 0).ToArray();
         if (usable.Length == 0)
         {
             return new JsonObject
@@ -23,11 +23,11 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
             };
         }
         var mode = prefs.Text("mode", "review");
-        var release = prefs.Text("release", DashboardConstants.CurrentRelease);
+        var release = prefs.Text("release", DashboardConstants.CurrentRelease).Trim();
         var showDrafts = prefs.Flag("showDrafts");
         var reviewLimit = Math.Max(1, prefs.Number("reviewLimit", DashboardConstants.ReviewLimit));
         var viewers = usable.Select(account => account.Login.ToLowerInvariant()).ToHashSet(StringComparer.Ordinal);
-        var repos = usable.SelectMany(account => account.Repos).Distinct(StringComparer.Ordinal).ToArray();
+        var repos = usable.SelectMany(account => account.Repos).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         using var concurrency = new SemaphoreSlim(8);
         var jobs = usable.SelectMany(account => account.Repos.Select(repo =>
             LoadRepositoryAsync(account, repo, mode == "issues", viewers, concurrency, ct))).ToArray();
@@ -42,7 +42,7 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
         var successful = results.Where(result => result.Error is null).Select(result => (result.Host, result.Repo)).ToHashSet();
         var errors = results.Where(result => result.Error is not null && !successful.Contains((result.Host, result.Repo)))
             .Select(result => result.Error!).Distinct(StringComparer.Ordinal);
-        var model = new ReviewModel();
+        var model = new ReviewModel(prefs: prefs);
         var visible = prs.Where(pr => showDrafts || !pr.Flag("draft")).ToArray();
         var lanes = mode switch
         {
@@ -103,6 +103,10 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
                     new JsonObject { ["owner"] = parts[0], ["name"] = parts[1], ["after"] = after }, ct).ConfigureAwait(false);
                 var repository = response["data"]?["repository"] as JsonObject ??
                     throw new InvalidDataException("Repository is unavailable or this account does not have access.");
+                if (!repository.Text("nameWithOwner", repo).Equals(repo, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidDataException("GitHub returned a different repository than requested.");
+                }
                 var connection = repository[issues ? "issues" : "pullRequests"] as JsonObject ??
                     throw new InvalidDataException("GitHub returned no repository connection.");
                 if (connection["nodes"] is not JsonArray)
@@ -118,6 +122,10 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
                     if (node.Date("createdAt") is null || node.Date("updatedAt") is null)
                     {
                         throw new InvalidDataException("GitHub returned an item without valid createdAt/updatedAt timestamps.");
+                    }
+                    if (!IsRepositoryUrl(node.Text("url"), host, repo))
+                    {
+                        throw new InvalidDataException("GitHub returned an item outside the selected repository.");
                     }
                     items.Add(issues ? NormalizeIssue(repo, node, viewers) : NormalizePr(repo, node, viewers, repository.Flag("isPrivate")));
                 }
@@ -177,7 +185,8 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
             ["completedAt"] = null,
             ["failingChecks"] = new JsonArray()
         };
-        var review = DeriveReview(Nodes(node, "reviews").ToArray(), requested, viewers, repo, unresolved);
+        var review = DeriveReview(Nodes(node, "reviews").ToArray(), requested, viewers,
+            node["baseRef"]?["branchProtectionRule"].Flag("requiresConversationResolution") == true, unresolved);
         var author = node["author"].Text("login", "ghost");
         if (IsCopilotLogin(author))
         {
@@ -213,7 +222,7 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
             ["commitCount"] = node["commits"].Number("totalCount", commitNodes.Length),
             ["lastCommitAt"] = review["lastReviewedAt"] is not null && review.Text("state") is "reviewed" or "changes_requested"
                 ? commitNodes.LastOrDefault()?["commit"]?["committedDate"]?.DeepClone() : null,
-            ["linkedIssues"] = JsonData.Array(Nodes(node, "closingIssuesReferences").Select(issue => new JsonObject
+            ["linkedIssues"] = JsonData.Array(ScopedLinkedNodes(node, "closingIssuesReferences", repo).Select(issue => new JsonObject
             {
                 ["repository"] = issue["repository"].Text("nameWithOwner", repo),
                 ["number"] = issue.Number("number"),
@@ -253,7 +262,7 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
             ["milestone"] = node["milestone"]?["title"]?.DeepClone(),
             ["labels"] = JsonData.Array(Nodes(node, "labels").Select(label => label.Text("name"))),
             ["assignees"] = JsonData.Array(assignees),
-            ["linkedPullRequests"] = JsonData.Array(Nodes(node, "closedByPullRequestsReferences").Where(pr => pr.Text("state") != "CLOSED").Select(pr => new JsonObject
+            ["linkedPullRequests"] = JsonData.Array(ScopedLinkedNodes(node, "closedByPullRequestsReferences", repo).Where(pr => pr.Text("state") != "CLOSED").Select(pr => new JsonObject
             {
                 ["repository"] = pr["repository"].Text("nameWithOwner", repo),
                 ["number"] = pr.Number("number"),
@@ -266,7 +275,8 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
         };
     }
 
-    private static JsonObject DeriveReview(IReadOnlyList<JsonObject> reviews, string[] requested, HashSet<string> viewers, string repo, int rawUnresolved)
+    private static JsonObject DeriveReview(IReadOnlyList<JsonObject> reviews, string[] requested, HashSet<string> viewers,
+        bool requiresConversationResolution, int rawUnresolved)
     {
         var human = reviews.Where(review => review["author"].Text("login").Length > 0 &&
             !IsBotReviewer(review["author"].Text("login")) && review.Date("submittedAt") is not null)
@@ -291,7 +301,7 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
             ["lastReviewedAt"] = human.LastOrDefault()?["submittedAt"]?.DeepClone(),
             ["copilotReviewed"] = copilot,
             ["unresolvedThreadCount"] = state is "approved" or "reviewed" || (state == "waiting" && copilot) ? rawUnresolved : 0,
-            ["requiresConversationResolution"] = repo.Equals("microsoft/aspire", StringComparison.OrdinalIgnoreCase),
+            ["requiresConversationResolution"] = requiresConversationResolution,
             ["reviewRequestedFromViewer"] = requested.Any(login => viewers.Contains(login.ToLowerInvariant())),
             ["viewerApproved"] = latest.Values.Any(review => review.Text("state") == "APPROVED" && viewers.Contains(review["author"].Text("login").ToLowerInvariant()))
         };
@@ -311,6 +321,20 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
     }
 
     private static IEnumerable<JsonObject> Nodes(JsonObject node, string key) => node[key]?["nodes"].Objects() ?? [];
+
+    internal static bool IsRepositoryUrl(string value, string host, string repository) =>
+        Uri.TryCreate(value, UriKind.Absolute, out var uri) && uri.Scheme == "https" && uri.UserInfo.Length == 0 &&
+        uri.Authority.Equals(host, StringComparison.OrdinalIgnoreCase) &&
+        (uri.AbsolutePath.Equals($"/{repository}", StringComparison.OrdinalIgnoreCase) ||
+         uri.AbsolutePath.StartsWith($"/{repository}/", StringComparison.OrdinalIgnoreCase));
+
+    private static IEnumerable<JsonObject> ScopedLinkedNodes(JsonObject node, string key, string repository)
+    {
+        var host = Uri.TryCreate(node.Text("url"), UriKind.Absolute, out var uri) ? uri.Authority : "";
+        return Nodes(node, key).Where(linked =>
+            linked["repository"].Text("nameWithOwner").Equals(repository, StringComparison.OrdinalIgnoreCase) &&
+            IsRepositoryUrl(linked.Text("url"), host, repository));
+    }
 
     public static IReadOnlyList<JsonObject> DedupeSignals(IEnumerable<JsonObject> signals) => signals.DistinctBy(signal => Concept(signal.Text("label"))).ToArray();
 
@@ -338,7 +362,6 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
             "quick wins" or "quick win" => "quick wins",
             "stalled" or "unstick" => "stalled",
             "docs" or "docs review" => "docs",
-            "community toolkit" or "toolkit review" => "community toolkit",
             "bots / automation" or "automation" or "bot" => "bots / automation",
             _ => normalized
         };
@@ -460,11 +483,12 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
     private static IReadOnlyList<JsonObject> BucketShip(IReadOnlyList<JsonObject> prs, string release, bool showDrafts, ReviewModel model)
     {
         var lanes = new[] { Lane("ready", "Ready to ship", "success"), Lane("in-progress", "In progress", "accent"), Lane("blocked", "Blocked", "danger") };
-        foreach (var pr in prs.Where(pr => pr.Text("milestone") == release && (showDrafts || !pr.Flag("draft"))))
+        foreach (var pr in prs.Where(pr => (release.Length == 0 || pr.Text("milestone") == release) && (showDrafts || !pr.Flag("draft"))))
         {
             var index = pr.Text("checksState") == "failure" || pr.Text("mergeable") == "CONFLICTING" || pr["review"].Text("state") == "changes_requested"
                 ? 2 : IsReadyToMerge(pr) ? 0 : 1;
-            ((JsonArray)lanes[index]["items"]!).Add((JsonNode)Card(pr, $"Milestone {release}", model));
+            var reason = pr.Text("milestone") is { Length: > 0 } milestone ? $"Milestone {milestone}" : "No milestone";
+            ((JsonArray)lanes[index]["items"]!).Add((JsonNode)Card(pr, reason, model));
         }
         return lanes.Where(lane => lane["items"].Objects().Any()).ToArray();
     }
@@ -510,7 +534,7 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
                 ["items"] = JsonData.Array(bucket.Items.Select(item => Card(item.PullRequest, item.Reason, model, reviewDebt: true)))
             })),
             ["community"] = JsonData.Array(model.ComputeCommunityItems(prs).Select(item => Card(item.PullRequest, "Community", model, reviewDebt: true))),
-            ["developerCounts"] = JsonData.Array(ReviewModel.CreateDeveloperPullRequestCounts(prs))
+            ["developerCounts"] = JsonData.Array(model.CreateDeveloperPullRequestCounts(prs))
         };
     }
 
@@ -570,13 +594,14 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
     private const string PullRequestQuery = """
         query($owner:String!, $name:String!, $after:String) {
           repository(owner:$owner, name:$name) {
-            isPrivate
+            nameWithOwner isPrivate
             pullRequests(states:OPEN, first:40, after:$after, orderBy:{field:UPDATED_AT, direction:DESC}) {
               pageInfo { hasNextPage endCursor }
               nodes {
                 number title url isDraft state createdAt updatedAt
                 author { __typename login avatarUrl }
                 baseRefName mergeable reviewDecision
+                baseRef { branchProtectionRule { requiresConversationResolution } }
                 readyForReviewEvents: timelineItems(last:1, itemTypes:[READY_FOR_REVIEW_EVENT]) {
                   nodes { ... on ReadyForReviewEvent { createdAt } }
                 }
@@ -603,6 +628,7 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
     private const string IssueQuery = """
         query($owner:String!, $name:String!, $after:String) {
           repository(owner:$owner, name:$name) {
+            nameWithOwner
             issues(states:OPEN, first:40, after:$after, orderBy:{field:UPDATED_AT, direction:DESC}) {
               pageInfo { hasNextPage endCursor }
               nodes {

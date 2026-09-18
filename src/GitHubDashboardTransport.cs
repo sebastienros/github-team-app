@@ -6,7 +6,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
-namespace Aspire.TeamApp;
+namespace GitHub.TeamApp;
 
 internal static class GitHubDashboardTransport
 {
@@ -47,7 +47,7 @@ internal static class GitHubDashboardTransport
     {
         var request = new HttpRequestMessage(method, url);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        request.Headers.UserAgent.ParseAdd("aspire-team-app");
+        request.Headers.UserAgent.ParseAdd("github-team-app");
         request.Headers.Accept.ParseAdd("application/vnd.github+json");
         return request;
     }

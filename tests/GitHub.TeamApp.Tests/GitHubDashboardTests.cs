@@ -8,7 +8,7 @@ using System.Text.Json.Nodes;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
-namespace Aspire.TeamApp.Tests;
+namespace GitHub.TeamApp.Tests;
 
 public class GitHubDashboardTests
 {
@@ -147,6 +147,228 @@ public class GitHubDashboardTests
     }
 
     [Fact]
+    public void DefaultsDoNotSelectRepositoriesReleaseOrTeamMembers()
+    {
+        Assert.Empty(DashboardConstants.DefaultRepos);
+        Assert.Empty(DashboardConstants.DefaultEmuRepos);
+        Assert.Empty(DashboardConstants.CoreTeamMemberAliasSuffixes);
+        Assert.Equal("", DashboardConstants.CurrentRelease);
+        var model = new ReviewModel();
+        var prs = new[] { Normalized(1), Normalized(2, "outsider"), Normalized(3, "someone_microsoft") };
+        Assert.Empty(model.CreateDeveloperPullRequestCounts(prs));
+        Assert.Empty(model.ComputeCommunityItems(prs));
+        Assert.Equal(3, model.ComputeFocusItems(model.CreateAttentionBuckets(prs, "octo")).Count);
+        Assert.All(prs, pr => Assert.DoesNotContain(model.CreateAttentionSignals(pr),
+            signal => signal.Text("label").StartsWith("release ", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task EmptyRepositorySelectionNeverExpandsToDefaults()
+    {
+        using var http = Client((_, _) => throw new InvalidOperationException("No provider queries expected."));
+        var result = await Dashboard(http).LoadAsync([Account() with { Repos = [] }], new JsonObject(), TestContext.Current.CancellationToken);
+        Assert.True(result.Flag("authenticated"));
+        Assert.Empty(result["repos"].Strings());
+        Assert.Equal(0, result["counts"].Number("total"));
+        Assert.Empty(result["notifications"].Objects());
+        Assert.Empty(result["errors"].Strings());
+    }
+
+    [Theory]
+    [InlineData(false, "token", "octo")]
+    [InlineData(true, "", "octo")]
+    [InlineData(true, "token", "")]
+    public async Task UnusableAccountsNeverQueryProviders(bool active, string token, string login)
+    {
+        using var http = Client((_, _) => throw new InvalidOperationException("No provider queries expected."));
+        var account = Account(token) with { Active = active, Login = login };
+        var result = await Dashboard(http).LoadAsync([account], new JsonObject(), TestContext.Current.CancellationToken);
+        Assert.False(result.Flag("authenticated"));
+    }
+
+    [Theory]
+    [InlineData("review")]
+    [InlineData("ship")]
+    [InlineData("issues")]
+    public async Task QueriesOnlySelectedRepositoryAndAccountAcrossSnapshots(string mode)
+    {
+        var requests = new List<string>();
+        using var http = Client((request, body) =>
+        {
+            Assert.Equal(HttpMethod.Post, request.Method);
+            Assert.Equal("https://ghe.example.com/api/graphql", request.RequestUri!.AbsoluteUri);
+            var repository = $"{body["variables"].Text("owner")}/{body["variables"].Text("name")}";
+            requests.Add($"{request.Headers.Authorization!.Parameter}:{repository}");
+            var node = mode == "issues" ? IssueNode(1) : ApprovedNode(1);
+            node["url"] = $"https://ghe.example.com/{repository}/{(mode == "issues" ? "issues" : "pull")}/1";
+            return Response(node, mode == "issues");
+        });
+        var dashboard = Dashboard(http);
+        foreach (var repository in new[] { "contoso/widgets", "fabrikam/tools" })
+        {
+            var selected = Account(repository, "ghe.example.com") with { Repos = [repository] };
+            var result = await dashboard.LoadAsync([selected, Account("inactive") with { Active = false }],
+                Prefs(mode), TestContext.Current.CancellationToken);
+            Assert.Equal([repository], result["repos"].Strings());
+            Assert.Equal(["octo"], result["viewers"].Strings());
+            var card = Assert.Single(result["lanes"].Objects().SelectMany(lane => lane["items"].Objects()));
+            Assert.Equal(repository, card[mode == "issues" ? "issue" : "pr"].Text("repository"));
+            Assert.All(result["notifications"].Objects(), notification => Assert.Equal(repository, notification.Text("repository")));
+            Assert.Empty(result["errors"].Strings());
+        }
+        Assert.Equal(["contoso/widgets:contoso/widgets", "fabrikam/tools:fabrikam/tools"], requests);
+    }
+
+    [Theory]
+    [InlineData("https://github.com/microsoft/aspire-extra/pull/2")]
+    [InlineData("https://github.com/other/repo/pull/2")]
+    [InlineData("https://ghe.example.com/microsoft/aspire/pull/2")]
+    public async Task ForeignProviderItemsNeverEnterCountsClassificationOrNotifications(string foreignUrl)
+    {
+        var foreign = ApprovedNode(2);
+        foreign["url"] = foreignUrl;
+        using var http = Client((_, _) => JsonResponse(ResponseBody([ApprovedNode(1), foreign])));
+        var result = await Dashboard(http).LoadAsync([Account()], Prefs("review"), TestContext.Current.CancellationToken);
+        Assert.Equal(1, result["counts"].Number("total"));
+        Assert.Equal(1, Assert.Single(result["attention"]!["focus"].Objects())["pr"].Number("number"));
+        Assert.Equal(1, Assert.Single(result["notifications"].Objects()).Number("number"));
+        Assert.Equal(["microsoft/aspire (github.com): GitHub returned an item outside the selected repository."], result["errors"].Strings());
+    }
+
+    [Fact]
+    public async Task ForeignRepositoryResponseIsReportedRatherThanRelabeled()
+    {
+        using var http = Client((_, _) =>
+        {
+            var body = ResponseBody([PrNode(1)]);
+            body["data"]!["repository"]!["nameWithOwner"] = "other/repo";
+            return JsonResponse(body);
+        });
+        var result = await Dashboard(http).LoadAsync([Account()], Prefs("review"), TestContext.Current.CancellationToken);
+        Assert.Equal(0, result["counts"].Number("total"));
+        Assert.Equal(["microsoft/aspire (github.com): GitHub returned a different repository than requested."], result["errors"].Strings());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LinkedItemsAreRestrictedToTheSelectedRepositoryAndHost(bool issues)
+    {
+        var node = issues ? IssueNode(1) : PrNode(1);
+        var links = new[] { ("microsoft/aspire", "github.com"), ("other/repo", "github.com"), ("microsoft/aspire", "ghe.example.com") }
+            .Select((scope, index) => new JsonObject
+            {
+                ["number"] = index + 10,
+                ["title"] = index == 0 ? "Local fix" : "Regression for 13.5",
+                ["state"] = "OPEN",
+                ["url"] = $"https://{scope.Item2}/{scope.Item1}/{(issues ? "pull" : "issues")}/{index + 10}",
+                ["repository"] = new JsonObject { ["nameWithOwner"] = scope.Item1 },
+                ["labels"] = index == 0 ? Connection() : Connection(new JsonObject { ["name"] = "regression" })
+            }).ToArray();
+        node["milestone"] = null;
+        node[issues ? "closedByPullRequestsReferences" : "closingIssuesReferences"] = Connection(links);
+        using var http = Client((_, _) => Response(node, issues));
+        var result = await Dashboard(http).LoadAsync([Account()], Prefs(issues ? "issues" : "review"), TestContext.Current.CancellationToken);
+        var card = Assert.Single(result["lanes"].Objects().SelectMany(lane => lane["items"].Objects()));
+        var item = card[issues ? "issue" : "pr"]!;
+        Assert.Equal(10, Assert.Single(item[issues ? "linkedPullRequests" : "linkedIssues"].Objects()).Number("number"));
+        Assert.DoesNotContain(card["signals"].Objects(), signal => signal.Text("label") is "regression" or "release 13.5");
+    }
+
+    [Fact]
+    public void ModelDoesNotClassifyFromForeignLinkedIssues()
+    {
+        var pr = Normalized(1);
+        pr["milestone"] = null;
+        pr["linkedIssues"] = new JsonArray(new JsonObject
+        {
+            ["repository"] = "other/repo",
+            ["title"] = "Fix 13.5",
+            ["labels"] = JsonData.Array(["regression"])
+        });
+        Assert.DoesNotContain(Model().CreateAttentionSignals(pr), signal => signal.Text("label") is "regression" or "release 13.5");
+    }
+
+    [Fact]
+    public async Task TeamPreferencesAreExplicitAndDoNotLeakBetweenSnapshots()
+    {
+        using var http = Client((_, _) => JsonResponse(ResponseBody(
+            [PrNode(1, "alice"), PrNode(2, "bob/copilot"), PrNode(3, "alice_microsoft")])));
+        var dashboard = Dashboard(http);
+        var prefs = Prefs("review");
+        prefs["teamMembers"] = JsonData.Array([" Alice ", "alice", ""]);
+        var first = await dashboard.LoadAsync([Account()], prefs, TestContext.Current.CancellationToken);
+        Assert.Equal("Alice", Assert.Single(first["attention"]!["developerCounts"].Objects()).Text("actor"));
+        Assert.Equal([2, 3], first["attention"]!["community"].Objects().Select(card => card["pr"].Number("number")).Order());
+        prefs["teamMembers"] = JsonData.Array(["bob"]);
+        var second = await dashboard.LoadAsync([Account()], prefs, TestContext.Current.CancellationToken);
+        Assert.Equal("bob", Assert.Single(second["attention"]!["developerCounts"].Objects()).Text("actor"));
+        Assert.Equal([1, 3], second["attention"]!["community"].Objects().Select(card => card["pr"].Number("number")).Order());
+        prefs["teamMembers"] = new JsonArray();
+        var empty = await dashboard.LoadAsync([Account()], prefs, TestContext.Current.CancellationToken);
+        Assert.Empty(empty["attention"]!["developerCounts"].Objects());
+        Assert.Empty(empty["attention"]!["community"].Objects());
+        Assert.Equal(3, empty["attention"]!["focus"].Objects().Count());
+    }
+
+    [Theory]
+    [InlineData(null, false)]
+    [InlineData("", false)]
+    [InlineData("  ", false)]
+    [InlineData("", true)]
+    public async Task ShipWithoutReleaseIncludesEveryMilestoneAndUnmilestonedWork(string? release, bool showDrafts)
+    {
+        var ready = ApprovedNode(1);
+        ready["milestone"] = null;
+        var progress = PrNode(2);
+        progress["milestone"]!["title"] = "next";
+        var blocked = PrNode(3);
+        blocked["mergeable"] = "CONFLICTING";
+        var draft = PrNode(4);
+        draft["isDraft"] = true;
+        using var http = Client((_, _) => JsonResponse(ResponseBody([ready, progress, blocked, draft])));
+        var prefs = new JsonObject { ["mode"] = "ship", ["showDrafts"] = showDrafts };
+        if (release is not null)
+        {
+            prefs["release"] = release;
+        }
+        var result = await Dashboard(http).LoadAsync([Account()], prefs, TestContext.Current.CancellationToken);
+        Assert.Equal("", result.Text("release"));
+        Assert.Equal(["ready", "in-progress", "blocked"], result["lanes"].Objects().Select(lane => lane.Text("id")));
+        var cards = result["lanes"].Objects().SelectMany(lane => lane["items"].Objects()).ToArray();
+        Assert.Equal(showDrafts ? [1, 2, 3, 4] : new[] { 1, 2, 3 }, cards.Select(card => card["pr"].Number("number")).Order());
+        Assert.Equal("No milestone", cards.Single(card => card["pr"].Number("number") == 1).Text("reason"));
+        Assert.Equal("Milestone next", cards.Single(card => card["pr"].Number("number") == 2).Text("reason"));
+        Assert.All(cards, card => Assert.DoesNotContain(card["signals"].Objects(),
+            signal => signal.Text("label").StartsWith("release ", StringComparison.Ordinal)));
+    }
+
+    [Theory]
+    [InlineData("14.2", "14.2", true)]
+    [InlineData("14.2", "14x2", false)]
+    [InlineData("14.2", "13.5", false)]
+    [InlineData("", "13.5", false)]
+    public void ReleaseSignalsUseOnlyConfiguredRelease(string release, string milestone, bool expected)
+    {
+        var pr = Normalized(1);
+        pr["milestone"] = milestone;
+        var model = new ReviewModel(prefs: new JsonObject { ["release"] = release });
+        Assert.Equal(expected, model.CreateAttentionSignals(pr).Any(signal => signal.Text("label") == $"release {release}"));
+        Assert.Equal(expected, model.CreateIssueSignals(pr).Any(signal => signal.Text("label") == $"release {release}"));
+    }
+
+    [Theory]
+    [InlineData("microsoft/aspire", false)]
+    [InlineData("contoso/widgets", true)]
+    public void ConversationResolutionComesFromBranchProtectionNotRepositoryName(string repository, bool required)
+    {
+        var node = PrNode(1);
+        node["baseRef"] = required ? new JsonObject { ["branchProtectionRule"] = new JsonObject { ["requiresConversationResolution"] = true } } : null;
+        var pr = GitHubDashboard.NormalizePr(repository, node, ["octo"], false);
+        Assert.Equal(required, pr["review"].Flag("requiresConversationResolution"));
+    }
+
+    [Fact]
     public async Task ReviewQueueRanksFromReadyForReviewAndCountsHiddenDrafts()
     {
         var oldDraft = PrNode(1);
@@ -216,9 +438,11 @@ public class GitHubDashboardTests
         using var http = Client((_, _) => JsonResponse(ResponseBody([regression, cti, afscrome, assigned, triage, active], issues: true)));
         var result = await Dashboard(http).LoadAsync([Account()], Prefs("issues"), TestContext.Current.CancellationToken);
 
-        Assert.Equal(["focus-regression", "focus-cti-team", "focus-afscrome-finds", "focus-my-issues", "triage", "active"],
+        Assert.Equal(["focus-regression", "focus-my-issues", "triage", "active"],
             result["lanes"].Objects().Select(lane => lane.Text("id")));
-        Assert.Equal([1, 2, 3, 4, 5, 6], result["lanes"].Objects().SelectMany(lane => lane["items"].Objects()).Select(item => item["issue"].Number("number")));
+        Assert.Equal([1, 2, 3, 4, 5, 6], result["lanes"].Objects().SelectMany(lane => lane["items"].Objects()).Select(item => item["issue"].Number("number")).Order());
+        Assert.Equal([2, 3, 5], result["lanes"].Objects().Single(lane => lane.Text("id") == "triage")["items"].Objects()
+            .Select(item => item["issue"].Number("number")).Order());
         Assert.Null(result["attention"]);
     }
 
@@ -297,14 +521,14 @@ public class GitHubDashboardTests
         Assert.True(pr.Flag("isMine"));
         Assert.Equal("davidfowl", ReviewModel.ActorIdentityKey(pr.Text("author")));
         Assert.Empty(new ReviewModel().CreateForMeItems([pr], ["davidfowl"]));
-        Assert.Equal("davidfowl", Assert.Single(ReviewModel.CreateDeveloperPullRequestCounts([pr])).Text("actor"));
+        Assert.Equal("davidfowl", Assert.Single(Model().CreateDeveloperPullRequestCounts([pr])).Text("actor"));
         var privatePr = GitHubDashboard.NormalizePr("org/private", PrNode(2, "outsider"), ["octo"], true);
-        Assert.False(ReviewModel.IsCommunityPullRequest(privatePr));
+        Assert.False(Model().IsCommunityPullRequest(privatePr));
         Assert.Single(new ReviewModel().ComputeFocusItems(new ReviewModel().CreateAttentionBuckets([privatePr], "octo")));
     }
 
     [Fact]
-    public void OwnershipAliasesAndSpecializedLanesMatchOriginalModel()
+    public void OnlyExplicitTeamMembersGetOwnershipAndRepositoryNamesDoNotCreateSpecializedLanes()
     {
         var alias = Normalized(1, "IEvangelist_microsoft");
         var unlisted = Normalized(2, "someone_microsoft");
@@ -317,15 +541,17 @@ public class GitHubDashboardTests
         var community = Normalized(6, "community-person");
         var held = Normalized(7);
         held["labels"] = JsonData.Array(["needs-author-action"]);
-        var model = new ReviewModel();
+        var prefs = Prefs("review");
+        prefs["teamMembers"] = JsonData.Array(["davidfowl", "IEvangelist_microsoft"]);
+        var model = new ReviewModel(prefs: prefs);
         var prs = new[] { alias, unlisted, docs, toolkit, bot, community, held };
         var buckets = model.CreateAttentionBuckets(prs, "octo");
-        Assert.Equal([1, 2], model.ComputeFocusItems(buckets).Select(item => item.PullRequest.Number("number")).Order());
-        Assert.Equal([6], model.ComputeCommunityItems(prs).Select(item => item.PullRequest.Number("number")));
-        Assert.Equal(new[] { "IEvangelist", "davidfowl", "someone_microsoft" }.Order(),
-            ReviewModel.CreateDeveloperPullRequestCounts(prs).Select(item => item.Text("actor")).Order());
+        Assert.Equal([1, 4], model.ComputeFocusItems(buckets).Select(item => item.PullRequest.Number("number")).Order());
+        Assert.Equal([2, 6], model.ComputeCommunityItems(prs).Select(item => item.PullRequest.Number("number")).Order());
+        Assert.Equal(new[] { "IEvangelist_microsoft", "davidfowl" }.Order(),
+            model.CreateDeveloperPullRequestCounts(prs).Select(item => item.Text("actor")).Order());
         Assert.Equal([3], buckets.Single(bucket => bucket.Label == "Docs").Items.Select(item => item.PullRequest.Number("number")));
-        Assert.Equal([4], buckets.Single(bucket => bucket.Label == "Community Toolkit").Items.Select(item => item.PullRequest.Number("number")));
+        Assert.DoesNotContain(buckets, bucket => bucket.Label == "Community Toolkit");
         Assert.Equal([5], buckets.Single(bucket => bucket.Label == "Bots / automation").Items.Select(item => item.PullRequest.Number("number")));
     }
 
@@ -336,7 +562,7 @@ public class GitHubDashboardTests
     public void ReviewDebtThresholdRetainsUnapprovedButNotApprovedWork(int age, bool debt, bool inFocus)
     {
         var now = DateTimeOffset.Parse("2026-09-18T12:00:00Z", System.Globalization.CultureInfo.InvariantCulture);
-        var model = new ReviewModel(new FixedClock(now));
+        var model = Model(new FixedClock(now));
         var pr = Normalized(1);
         pr["updatedAt"] = now.AddDays(-age).ToString("O");
         Assert.Equal(debt, model.IsReviewDebt(pr));
@@ -357,7 +583,7 @@ public class GitHubDashboardTests
         var response = (JsonObject)stalled.DeepClone();
         response["number"] = 2;
         response["review"]!["state"] = "changes_requested";
-        var model = new ReviewModel();
+        var model = Model();
         var focus = model.ComputeFocusItems(model.CreateAttentionBuckets([stalled, response], "octo"));
         Assert.Equal("Stalled", Assert.Single(focus).BucketLabel);
         response["lastCommitAt"] = Ago(1);
@@ -367,12 +593,12 @@ public class GitHubDashboardTests
 
     [Theory]
     [InlineData("microsoft/aspire", 0, "", 0, "failure", true)]
-    [InlineData("devdiv-microsoft/aspire-1p", 0, "", 0, "unknown", false)]
-    [InlineData("devdiv-microsoft/aspire-1p", 1, "GitOps/GitHubPop", 0, "success", false)]
-    [InlineData("devdiv-microsoft/aspire-1p", 1, "some proof of presence gate", 1, "pending", false)]
+    [InlineData("devdiv-microsoft/aspire-1p", 0, "", 0, "failure", true)]
+    [InlineData("devdiv-microsoft/aspire-1p", 1, "GitOps/GitHubPop", 0, "failure", true)]
+    [InlineData("devdiv-microsoft/aspire-1p", 1, "some proof of presence gate", 1, "failure", true)]
     [InlineData("devdiv-microsoft/aspire-1p", 2, "GitOps/GitHubPop", 0, "failure", true)]
     [InlineData("devdiv-microsoft/aspire-1p", 1, "build", 0, "failure", true)]
-    public void NonBlockingChecksRequireCompleteMatchingEvidence(string repo, int failures, string check, int pending, string expected, bool failing)
+    public void FailingChecksAreBlockingRegardlessOfRepositoryOrCheckName(string repo, int failures, string check, int pending, string expected, bool failing)
     {
         var pr = Normalized(1);
         pr["repository"] = repo;
@@ -391,7 +617,7 @@ public class GitHubDashboardTests
         var pr = Normalized(1);
         pr["milestone"] = null;
         pr["labels"] = JsonData.Array(["merge conflicts"]);
-        var model = new ReviewModel();
+        var model = Model();
         var raw = Assert.Single(model.CreateAttentionSignals(pr), signal => signal.Text("label") == "merge conflicts");
         Assert.Equal("repo-label", raw.Text("kind"));
         pr["labels"] = JsonData.Array(["regression"]);
@@ -416,14 +642,13 @@ public class GitHubDashboardTests
             ["assignees"] = new JsonArray(),
             ["updatedAt"] = Ago(1)
         };
-        Assert.Equal(["Blocking release", "release 13.5", "Regression", "CTI team", "afscrome finds", "Needs validation", "Installer/acquisition"],
-            new ReviewModel().CreateIssueSignals(issue).Select(signal => signal.Text("label")));
+        Assert.Equal(["Blocking release", "release 13.5", "Regression", "Needs validation", "Installer/acquisition", "blocking-release"],
+            Model().CreateIssueSignals(issue).Select(signal => signal.Text("label")));
         var plain = new JsonObject { ["title"] = "Problem", ["author"] = "octo", ["labels"] = new JsonArray(), ["assignees"] = new JsonArray(), ["updatedAt"] = Ago(1) };
         Assert.Equal(["Unowned"], new ReviewModel().CreateIssueSignals(plain).Select(signal => signal.Text("label")));
     }
 
-    // Captured from the original model.mjs with Date.now fixed to 2026-09-18T12:00:00Z.
-    // Keep the oracle as data so these tests need neither Node nor GitHub credentials.
+    // Historical fixtures use explicit team/release settings and generic repository classification.
     [Theory]
     [InlineData("baseline", "Needs review", "Needs review",
         "needs reviewer|warning|;open 2d|muted|;no reviews|warning|")]
@@ -439,15 +664,15 @@ public class GitHubDashboardTests
         "re-review|warning|;commit after review|warning|;open 2d|muted|;1 change request|danger|;reviewed 2d|muted|")]
     [InlineData("docs", "Docs;Needs review", "",
         "docs review|accent|;docs|accent|;open 2d|muted|;no reviews|warning|")]
-    [InlineData("toolkit", "Community Toolkit;Needs review", "",
-        "toolkit review|accent|;community toolkit|accent|;open 2d|muted|;no reviews|warning|")]
+    [InlineData("toolkit", "Needs review", "Needs review",
+        "needs reviewer|warning|;open 2d|muted|;no reviews|warning|")]
     [InlineData("aged-community", "Aged out community;Stalled", "",
         "aged out community|warning|;aged out community|warning|;idle 20d|warning|;review debt|danger|;open 2d|muted|;no reviews|warning|")]
     [InlineData("bot", "Bots / automation", "",
         "automation|accent|;open 2d|muted|;no reviews|warning|;bot|accent|")]
     [InlineData("unresolved", "Unresolved feedback", "",
         "resolve feedback|danger|;2 unresolved|danger|;open 2d|muted|;1 reviewer \u00b7 0 approvals|accent|;reviewed 1d|muted|;1 review comment|muted|")]
-    public void MatchesOriginalJavaScriptModelFixtures(string scenario, string expectedBuckets, string expectedFocus, string expectedSignals)
+    public void PreservesReviewModelFixturesWithExplicitPreferences(string scenario, string expectedBuckets, string expectedFocus, string expectedSignals)
     {
         var now = DateTimeOffset.Parse("2026-09-18T12:00:00Z", System.Globalization.CultureInfo.InvariantCulture);
         var pr = Normalized(1);
@@ -513,7 +738,7 @@ public class GitHubDashboardTests
                 break;
         }
 
-        var model = new ReviewModel(new FixedClock(now));
+        var model = Model(new FixedClock(now));
         var buckets = model.CreateAttentionBuckets([pr], "octo");
         Assert.Equal(expectedBuckets.Split(';', StringSplitOptions.RemoveEmptyEntries), buckets.Select(bucket => bucket.Label));
         Assert.Equal(expectedFocus.Split(';', StringSplitOptions.RemoveEmptyEntries), model.ComputeFocusItems(buckets).Select(item => item.BucketLabel));
@@ -551,7 +776,7 @@ public class GitHubDashboardTests
     }
 
     [Fact]
-    public async Task AccountsHonorLegacyPreferencesEmuDefaultsAndHostIsolation()
+    public async Task AccountsHonorLegacyPreferencesWithoutImplicitRepositories()
     {
         var env = new Dictionary<string, string?>
         {
@@ -631,7 +856,10 @@ public class GitHubDashboardTests
         });
         var env = new Dictionary<string, string?> { ["GH_TOKEN"] = "failed", ["GITHUB_TOKEN"] = "working" };
         var service = new AccountService(http, NullLogger<AccountService>.Instance, NoGh, () => env);
-        var accounts = await service.ResolveAsync(new JsonObject(), TestContext.Current.CancellationToken);
+        var accounts = await service.ResolveAsync(JsonNode.Parse("""
+            {"accounts":{"acct:github.com/failed":{"repos":["microsoft/aspire","microsoft/aspire.dev"]},
+                         "acct:github.com/working":{"repos":["microsoft/aspire","microsoft/aspire.dev"],"active":true}}}
+            """)!.AsObject(), TestContext.Current.CancellationToken);
         Assert.Equal(["working", "failed"], accounts.Select(account => account.Login));
         Assert.Equal(["partial", "failed"], accounts.Select(account => account.Metadata.Text("status")));
         Assert.Equal([true, false], accounts.Select(account => account.Active));
@@ -750,6 +978,7 @@ public class GitHubDashboardTests
         Task.FromResult(new ProcessResult(0, """{"hosts":{}}""", ""));
 
     private static GitHubDashboard Dashboard(HttpClient http) => new(http, NullLogger<GitHubDashboard>.Instance);
+    private static ReviewModel Model(TimeProvider? clock = null) => new(clock, Prefs("review"));
     private static Account Account(string token = "token", string host = "github.com") =>
         new($"acct:{host}/octo", "octo", host, token, ["microsoft/aspire"], true, new JsonObject());
 
@@ -757,6 +986,7 @@ public class GitHubDashboardTests
     {
         ["mode"] = mode,
         ["release"] = "13.5",
+        ["teamMembers"] = JsonData.Array(["davidfowl"]),
         ["notifications"] = new JsonObject { ["reviewRequested"] = true, ["readyToMerge"] = true, ["changesRequested"] = true, ["ciFailing"] = true }
     };
 
@@ -785,6 +1015,7 @@ public class GitHubDashboardTests
         ["updatedAt"] = Ago(1),
         ["author"] = new JsonObject { ["login"] = author, ["__typename"] = "User", ["avatarUrl"] = null },
         ["baseRefName"] = "main",
+        ["baseRef"] = new JsonObject { ["branchProtectionRule"] = new JsonObject { ["requiresConversationResolution"] = true } },
         ["mergeable"] = "MERGEABLE",
         ["reviewDecision"] = null,
         ["readyForReviewEvents"] = Connection(),

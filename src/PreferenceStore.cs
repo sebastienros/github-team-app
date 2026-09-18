@@ -4,7 +4,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
-namespace Aspire.TeamApp;
+namespace GitHub.TeamApp;
 
 internal sealed class PreferenceStore(string directory)
 {
@@ -27,6 +27,9 @@ internal sealed class PreferenceStore(string directory)
             ["ciFailing"] = true
         },
         ["accounts"] = new JsonObject(),
+        ["repositories"] = new JsonArray(),
+        ["selectedRepository"] = "",
+        ["teamMembers"] = new JsonArray(),
         ["azurePipelines"] = new JsonArray(),
         ["healthOrder"] = new JsonArray(),
         ["dismissedNotifications"] = new JsonArray()
@@ -101,6 +104,10 @@ internal sealed class PreferenceStore(string directory)
             foreach (var (key, value) in saved)
             {
                 prefs[key] = value?.DeepClone();
+            }
+            if (!saved.ContainsKey("repositories"))
+            {
+                RepositoryCatalog.Migrate(prefs);
             }
         }
         catch (FileNotFoundException)

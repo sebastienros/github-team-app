@@ -4,7 +4,7 @@
 using System.Globalization;
 using System.Text.Json.Nodes;
 
-namespace Aspire.TeamApp;
+namespace GitHub.TeamApp;
 
 internal static class SessionLauncher
 {
@@ -36,7 +36,7 @@ internal static class SessionLauncher
             }
             EnsureGitHubHost(uri.Host);
             // Use the original path, not Uri.AbsolutePath: URI normalization must not turn
-            // an input such as /other/../microsoft/aspire into a different repository.
+            // an input such as /other/../owner/repository into a different repository.
             var pathStart = value.IndexOf('/', value.IndexOf("://", StringComparison.Ordinal) + 3);
             value = pathStart < 0 ? "" : value[(pathStart + 1)..];
         }
@@ -73,9 +73,10 @@ internal static class SessionLauncher
             ["cliReason"] = "Copilot CLI session launching is not implemented.",
             ["githubEnterpriseServer"] = false
         };
-        settings["suggestedProjects"] = new JsonArray(
-            Project("Aspire", "https://github.com/microsoft/aspire"),
-            Project("Aspire 1P", "https://github.com/devdiv-microsoft/aspire-1p"));
+        settings["suggestedProjects"] = JsonData.Array(prefs["repositories"].Objects()
+            .Where(repository => repository.Text("host") == "github.com")
+            .Select(repository => Project(repository.Text("repository"),
+                $"https://github.com/{repository.Text("repository")}")));
         settings["documentationUrl"] = DocumentationUrl;
         return settings;
     }

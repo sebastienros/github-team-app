@@ -8,7 +8,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
-namespace Aspire.TeamApp;
+namespace GitHub.TeamApp;
 
 internal sealed class AzureDevOpsException(string code, string message) : Exception(message)
 {
@@ -17,21 +17,16 @@ internal sealed class AzureDevOpsException(string code, string message) : Except
 
 internal sealed class AzureDevOps
 {
-    private static readonly string[] s_officialNames = ["microsoft-aspire-codeql", "microsoft-aspire-Release-To-NuGet", "microsoft-aspire"];
     private readonly Func<IReadOnlyList<string>, bool, CancellationToken, Task<string>> _run;
-    private readonly TimeProvider _clock;
     private readonly SemaphoreSlim _commands = new(6);
-    private readonly Lock _cacheLock = new();
-    private readonly Dictionary<string, CacheEntry> _cache = new(StringComparer.Ordinal);
 
-    public AzureDevOps() : this(ExecuteCliAsync, TimeProvider.System)
+    public AzureDevOps() : this(ExecuteCliAsync)
     {
     }
 
-    internal AzureDevOps(Func<IReadOnlyList<string>, bool, CancellationToken, Task<string>> run, TimeProvider clock)
+    internal AzureDevOps(Func<IReadOnlyList<string>, bool, CancellationToken, Task<string>> run)
     {
         _run = run;
-        _clock = clock;
     }
 
     public Task<JsonObject> ResolvePipelineAsync(string url, string? branch, CancellationToken ct) =>
@@ -103,226 +98,6 @@ internal sealed class AzureDevOps
             ["buildId"] = buildId,
             ["inputUrl"] = new UriBuilder(uri) { Fragment = "" }.Uri.AbsoluteUri
         };
-    }
-
-    internal static JsonObject? ParseDefaults(string value)
-    {
-        // `az devops configure --list` prints INI, not JSON, even with -o json:
-        // [defaults]\norganization = https://dev.azure.com/dnceng\nproject = internal
-        var defaults = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        var section = "";
-        foreach (var raw in value.Split('\n'))
-        {
-            var line = raw.Trim();
-            if (line.StartsWith('[') && line.EndsWith(']'))
-            {
-                section = line[1..^1].Trim().ToLowerInvariant();
-                continue;
-            }
-            var equals = line.IndexOf('=');
-            if (section == "defaults" && equals > 0)
-            {
-                defaults[line[..equals].Trim()] = line[(equals + 1)..].Trim();
-            }
-        }
-        var project = defaults.GetValueOrDefault("project", "");
-        if (!ValidProject(project)
-            || !Uri.TryCreate(defaults.GetValueOrDefault("organization"), UriKind.Absolute, out var uri)
-            || uri.Scheme != "https" || uri.UserInfo.Length > 0)
-        {
-            return null;
-        }
-        string organization;
-        if (uri.Host.Equals("dev.azure.com", StringComparison.OrdinalIgnoreCase))
-        {
-            var parts = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length != 1 || !ValidEncoding(parts[0]))
-            {
-                return null;
-            }
-            organization = Uri.UnescapeDataString(parts[0]);
-        }
-        else if (uri.Host.EndsWith(".visualstudio.com", StringComparison.OrdinalIgnoreCase))
-        {
-            organization = uri.Host[..^".visualstudio.com".Length];
-        }
-        else
-        {
-            return null;
-        }
-        return ValidOrganization(organization) ? new JsonObject
-        {
-            ["organization"] = $"https://dev.azure.com/{Uri.EscapeDataString(organization)}",
-            ["organizationName"] = organization,
-            ["project"] = project
-        } : null;
-    }
-
-    internal async Task<JsonObject> DiscoverAsync(IReadOnlyList<string> repositories, CancellationToken ct)
-    {
-        var watched = repositories.Select(r => r.Trim()).Where(HealthDashboard.IsRepository)
-            .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-        if (watched.Length == 0)
-        {
-            return DiscoveryResult([], [], []);
-        }
-        // Both discovery branches settle independently: an inaccessible default project must
-        // never discard the curated first-party sources (or vice versa).
-        var results = await Task.WhenAll(
-            DiscoverOfficialAsync(watched, ct),
-            SettleDiscoveryAsync(() => DiscoverDefaultAsync(watched, ct), "Azure CLI default project pipelines", "azure-cli-default", false, ct));
-        var pipelines = results.SelectMany(r => r["pipelines"].Objects()).DistinctBy(p => p.Text("id")).ToArray();
-        var allWarnings = results.SelectMany(r => r["warnings"].Strings()).Distinct().ToArray();
-        var warnings = allWarnings.Take(3).ToList();
-        if (allWarnings.Length > warnings.Count)
-        {
-            warnings.Add($"{allWarnings.Length - warnings.Count} additional pipeline definitions could not be inspected.");
-        }
-        return DiscoveryResult(pipelines, warnings, results.SelectMany(r => r["providers"].Objects()));
-    }
-
-    private async Task<JsonObject> DiscoverOfficialAsync(string[] watched, CancellationToken ct)
-    {
-        if (!watched.Contains("microsoft/aspire", StringComparer.OrdinalIgnoreCase))
-        {
-            return DiscoveryResult([], [], []);
-        }
-        const string cacheKey = "official-definitions:dnceng/internal/microsoft-aspire";
-        if (TryCached(cacheKey, out var cached))
-        {
-            return (JsonObject)cached!;
-        }
-        var result = await SettleDiscoveryAsync(async () =>
-        {
-            var coordinates = new JsonObject
-            {
-                ["organization"] = "https://dev.azure.com/dnceng",
-                ["organizationName"] = "dnceng",
-                ["project"] = "internal"
-            };
-            var listed = await QueryAsync(ListArguments(coordinates, "microsoft-aspire"), ct);
-            var summaries = listed.Objects().Where(EnabledDefinition)
-                .Where(d => s_officialNames.Contains(d.Text("name"), StringComparer.OrdinalIgnoreCase)).Take(100).ToArray();
-            var inspected = await Task.WhenAll(summaries.Select(s => InspectAsync(coordinates, s, true, ct)));
-            var repository = new JsonObject { ["name"] = "microsoft-aspire", ["type"] = "TfsGit" };
-            var definitions = inspected.Select(i => i.Definition).OfType<JsonObject>().ToArray();
-            var valid = definitions.Where(d => UsesRepository(d, repository))
-                .OrderBy(d => Array.FindIndex(s_officialNames, name => name.Equals(d.Text("name"), StringComparison.OrdinalIgnoreCase))).ToArray();
-            var warnings = inspected.Select(i => i.Warning).OfType<string>()
-                .Concat(definitions.Where(d => !UsesRepository(d, repository)).Select(d => $"Official pipeline {d.Number("id")} is not bound to microsoft-aspire."))
-                .Concat(s_officialNames.Where(n => !summaries.Any(s => n.Equals(s.Text("name"), StringComparison.OrdinalIgnoreCase)))
-                    .Select(n => $"Official pipeline {n} was not found in dnceng/internal.")).ToList();
-            var providers = inspected.Select(i => i.Failure).OfType<AzureDevOpsException>()
-                .Select(e => Provider("official-default", "unavailable", e.Message, e.Code)).ToList();
-            providers.Add(Provider("official-default", warnings.Count > 0 || providers.Count > 0 ? "partial" : "available", null, null, valid.Length));
-            return DiscoveryResult(valid.Select(d => NormalizeDefinition(coordinates, d, null,
-                Discovery("official-default", "microsoft/aspire", "microsoft-aspire", valid.Length))), warnings, providers);
-        }, "Official Azure DevOps pipelines", "official-default", true, ct);
-        // Cache optional missing/auth failures, but retry transient query failures next poll.
-        if (!result["providers"].Objects().Any(p => p.Text("code") is "azdo_timeout" or "azdo_query_failed"))
-        {
-            Cache(cacheKey, result);
-        }
-        return result;
-    }
-
-    private async Task<JsonObject> DiscoverDefaultAsync(string[] watched, CancellationToken ct)
-    {
-        JsonNode? defaults;
-        if (!TryCached("defaults", out defaults))
-        {
-            defaults = ParseDefaults(await InvokeAsync(["devops", "configure", "--list"], true, ct));
-            Cache("defaults", defaults);
-        }
-        if (defaults is not JsonObject coordinates)
-        {
-            return DiscoveryResult([], [], [Provider("azure-cli-default", "not_configured", "No Azure CLI default organization and project are configured.")]);
-        }
-        var projectKey = $"{coordinates.Text("organizationName")}/{coordinates.Text("project")}".ToLowerInvariant();
-        var repositoriesKey = $"repositories:{projectKey}";
-        if (!TryCached(repositoriesKey, out var azureRepositories))
-        {
-            azureRepositories = await QueryAsync(["repos", "list", "--organization", coordinates.Text("organization"), "--project", coordinates.Text("project")], ct);
-            Cache(repositoriesKey, azureRepositories);
-        }
-        var associations = AssociateRepositories(azureRepositories.Objects(), watched);
-        var results = await Task.WhenAll(associations.Select(async association =>
-        {
-            var identity = HealthDashboard.Nonempty(association.Azure.Text("id"), association.Azure.Text("name"));
-            var definitionsKey = $"definitions:{projectKey}/{identity.ToLowerInvariant()}";
-            JsonObject result;
-            if (TryCached(definitionsKey, out var entry))
-            {
-                result = (JsonObject)entry!;
-            }
-            else
-            {
-                var listed = await QueryAsync(ListArguments(coordinates, identity), ct);
-                var summaries = listed.Objects().Where(EnabledDefinition).Take(100).ToArray();
-                var inspected = await Task.WhenAll(summaries.Select(s => InspectAsync(coordinates, s, false, ct)));
-                result = new JsonObject
-                {
-                    ["definitions"] = JsonData.Array(inspected.Select(i => i.Definition).OfType<JsonObject>()),
-                    ["warnings"] = JsonData.Array(inspected.Select(i => i.Warning).OfType<string>())
-                };
-                Cache(definitionsKey, result);
-            }
-            var candidates = result["definitions"].Objects()
-                .Where(d => UsesRepository(d, association.Azure) && !IsAuxiliary(d))
-                .OrderByDescending(DeliveryScore).ThenBy(d => d.Text("name"), StringComparer.CurrentCultureIgnoreCase)
-                .ThenBy(d => d.Number("id")).ToArray();
-            var definition = candidates.FirstOrDefault();
-            return (Pipeline: definition is null ? null : NormalizeDefinition(coordinates, definition, null,
-                Discovery("azure-cli-default", association.GitHub, association.Azure.Text("name"), candidates.Length)),
-                Warnings: result["warnings"].Strings().ToArray());
-        }));
-        var pipelines = results.Select(r => r.Pipeline).OfType<JsonObject>().ToArray();
-        var warnings = results.SelectMany(r => r.Warnings).ToArray();
-        return DiscoveryResult(pipelines, warnings, [Provider("azure-cli-default", warnings.Length > 0 ? "partial" : "available", null, null, pipelines.Length)]);
-    }
-
-    private static async Task<JsonObject> SettleDiscoveryAsync(Func<Task<JsonObject>> load, string description, string scope, bool official, CancellationToken ct)
-    {
-        try
-        {
-            return await load();
-        }
-        catch (Exception exception) when (IsProviderFailure(exception, ct))
-        {
-            var failure = AsError(exception);
-            var optional = OptionalFailure(failure) || official && failure.Code is "azdo_auth_required" or "azdo_access_denied";
-            // The original canvas suppresses optional-discovery warnings; expose the status
-            // separately so callers can explain missing internal sources without an error bar.
-            return DiscoveryResult([], optional ? [] : [$"{description} could not be discovered: {failure.Message}"],
-                [Provider(scope, "unavailable", failure.Message, failure.Code)]);
-        }
-    }
-
-    private async Task<Inspection> InspectAsync(JsonObject coordinates, JsonObject summary, bool official, CancellationToken ct)
-    {
-        try
-        {
-            var detail = await QueryAsync(["pipelines", "show", "--id", summary.Number("id").ToString(CultureInfo.InvariantCulture),
-                "--organization", coordinates.Text("organization"), "--project", coordinates.Text("project")], ct) as JsonObject
-                ?? throw Error("pipeline_not_found", "The Azure DevOps pipeline definition is invalid.");
-            if (PositiveInteger(detail["id"]) != PositiveInteger(summary["id"]))
-            {
-                throw Error("pipeline_not_found", "The Azure DevOps pipeline definition is invalid.");
-            }
-            var definition = (JsonObject)summary.DeepClone();
-            foreach (var property in detail)
-            {
-                definition[property.Key] = property.Value?.DeepClone();
-            }
-            definition["queueStatus"] = detail["queueStatus"]?.DeepClone() ?? summary["queueStatus"]?.DeepClone();
-            return new(definition, null, null);
-        }
-        catch (Exception exception) when (IsProviderFailure(exception, ct))
-        {
-            var failure = AsError(exception);
-            var optional = official && (OptionalFailure(failure) || failure.Code is "azdo_auth_required" or "azdo_access_denied");
-            return new(null, optional ? null : $"{(official ? "Official pipeline" : "Pipeline")} {summary.Number("id")} could not be inspected: {failure.Message}", failure);
-        }
     }
 
     internal async Task<JsonObject> LoadPipelineHealthAsync(JsonObject raw, DateTimeOffset now, CancellationToken ct)
@@ -513,7 +288,7 @@ internal sealed class AzureDevOps
         {
             throw Error("pipeline_not_found", $"Azure DevOps pipeline {definitionId} was not found.");
         }
-        return NormalizeDefinition(parsed, definition, branch, null);
+        return NormalizeDefinition(parsed, definition, branch);
     }
 
     private static JsonObject ParseConfiguration(JsonObject raw)
@@ -545,12 +320,11 @@ internal sealed class AzureDevOps
         return parsed;
     }
 
-    private static JsonObject NormalizeDefinition(JsonObject parsed, JsonObject definition, string? branch, JsonObject? discovery)
+    private static JsonObject NormalizeDefinition(JsonObject parsed, JsonObject definition, string? branch)
     {
         var id = PositiveInteger(definition["id"]) ?? throw Error("pipeline_not_found", "The Azure DevOps pipeline definition is invalid.");
         var organization = parsed.Text("organizationName");
         var project = parsed.Text("project");
-        var normalizedDiscovery = NormalizeDiscovery(discovery);
         return new JsonObject
         {
             ["id"] = $"azdo:{organization.ToLowerInvariant()}/{project.ToLowerInvariant()}/{id}",
@@ -563,8 +337,8 @@ internal sealed class AzureDevOps
             ["name"] = HealthDashboard.Nonempty(definition.Text("name"), $"Pipeline {id}"),
             ["branch"] = NormalizeBranch(HealthDashboard.Nonempty(branch ?? "", definition["repository"].Text("defaultBranch"), "refs/heads/main")),
             ["repository"] = NormalizeRepository(definition["repository"]),
-            ["discovered"] = normalizedDiscovery is not null,
-            ["discovery"] = normalizedDiscovery
+            ["discovered"] = false,
+            ["discovery"] = null
         };
     }
 
@@ -592,69 +366,13 @@ internal sealed class AzureDevOps
         var kind = value.Text("kind");
         var repository = value.Text("repository").Trim();
         var azureRepository = value.Text("azureRepository").Trim();
+        // Preserve provenance on explicitly saved legacy pipelines without enabling discovery.
         return kind is "azure-cli-default" or "official-default" && StrictRepository(repository) && ValidProject(azureRepository)
             ? Discovery(kind, repository, azureRepository, Math.Max(1, PositiveInteger(value?["pipelineCandidates"]) ?? 1)) : null;
     }
 
     private static JsonObject Discovery(string kind, string repository, string azureRepository, int count) =>
         new() { ["kind"] = kind, ["repository"] = repository, ["azureRepository"] = azureRepository, ["pipelineCandidates"] = Math.Max(1, count) };
-
-    private static JsonObject DiscoveryResult(IEnumerable<JsonObject> pipelines, IEnumerable<string> warnings, IEnumerable<JsonObject> providers) =>
-        new() { ["pipelines"] = JsonData.Array(pipelines), ["warnings"] = JsonData.Array(warnings), ["providers"] = JsonData.Array(providers) };
-
-    private static JsonObject Provider(string scope, string status, string? message, string? code = null, int count = 0) =>
-        new() { ["provider"] = "azure-devops", ["scope"] = scope, ["status"] = status, ["message"] = message, ["code"] = code, ["sourceCount"] = count };
-
-    private static List<Association> AssociateRepositories(IEnumerable<JsonObject> repositories, string[] watched)
-    {
-        var matches = new List<Association>();
-        foreach (var repository in repositories)
-        {
-            if (repository.Text("name").Length == 0 || !AzureRepositoryType(repository.Text("type", "TfsGit")))
-            {
-                continue;
-            }
-            var key = HealthDashboard.RepositoryMatchKey(repository.Text("name"));
-            var full = watched.Where(w => HealthDashboard.RepositoryMatchKey(w) == key).ToArray();
-            var candidates = full.Length > 0 ? full : watched.Where(w => HealthDashboard.RepositoryMatchKey(w.Split('/')[1]) == key).ToArray();
-            if (candidates.Length == 1)
-            {
-                matches.Add(new(candidates[0], repository));
-            }
-        }
-        return matches.GroupBy(m => m.GitHub, StringComparer.OrdinalIgnoreCase).Where(g => g.Count() == 1).Select(g => g.First()).ToList();
-    }
-
-    private static bool UsesRepository(JsonObject definition, JsonObject repository)
-    {
-        var source = definition["repository"];
-        if (source is null || !AzureRepositoryType(source.Text("type")))
-        {
-            return false;
-        }
-        return source.Text("id").Length > 0 && repository.Text("id").Length > 0
-            ? source.Text("id").Equals(repository.Text("id"), StringComparison.OrdinalIgnoreCase)
-            : HealthDashboard.RepositoryMatchKey(source.Text("name")) == HealthDashboard.RepositoryMatchKey(repository.Text("name"));
-    }
-
-    private static bool AzureRepositoryType(string type) => type.Equals("TfsGit", StringComparison.OrdinalIgnoreCase) || type.Equals("AzureReposGit", StringComparison.OrdinalIgnoreCase);
-    private static bool EnabledDefinition(JsonObject definition) => PositiveInteger(definition["id"]) is not null && !definition.Text("queueStatus").Equals("disabled", StringComparison.OrdinalIgnoreCase);
-    private static string SearchText(JsonObject definition) => $"{definition.Text("name")} {definition.Text("path")} {definition["process"].Text("yamlFilename")}";
-    private static bool IsAuxiliary(JsonObject definition) => Regex.IsMatch(SearchText(definition), @"merge\s*changes|mergechanges|sync|mirror|cleanup|provision|generated|\bunofficial\b|\bold\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-
-    private static int DeliveryScore(JsonObject definition)
-    {
-        var text = SearchText(definition);
-        var options = RegexOptions.IgnoreCase | RegexOptions.CultureInvariant;
-        return (Regex.IsMatch(text, @"\b(prod|production)\b", options) ? 400 : 0)
-            + (Regex.IsMatch(text, @"\b(release|deploy|deployment|publish)\b", options) ? 200 : 0)
-            + (Regex.IsMatch(text, @"\b(build|ci|validation)\b", options) ? 100 : 0)
-            - (Regex.IsMatch(text, @"\b(test|staging)\b", options) ? 20 : 0);
-    }
-
-    private static string[] ListArguments(JsonObject coordinates, string repository) =>
-        ["pipelines", "list", "--organization", coordinates.Text("organization"), "--project", coordinates.Text("project"),
-            "--repository", repository, "--repository-type", "tfsgit", "--query-order", "ModifiedDesc", "--top", "100"];
 
     internal static string? GitHubRepository(JsonNode? repository)
     {
@@ -868,33 +586,6 @@ internal sealed class AzureDevOps
         int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var number) && number > 0 ? number : null;
     private static string Scalar(JsonNode? value) => value is JsonValue scalar && scalar.TryGetValue<string>(out var text) ? text : value?.ToJsonString() ?? "";
 
-    private bool TryCached(string key, out JsonNode? value)
-    {
-        lock (_cacheLock)
-        {
-            if (_cache.TryGetValue(key, out var entry) && entry.ExpiresAt > _clock.GetUtcNow())
-            {
-                value = entry.Value?.DeepClone();
-                return true;
-            }
-            _cache.Remove(key);
-        }
-        value = null;
-        return false;
-    }
-
-    private void Cache(string key, JsonNode? value)
-    {
-        lock (_cacheLock)
-        {
-            _cache[key] = new(value?.DeepClone(), _clock.GetUtcNow().AddMinutes(10));
-            if (_cache.Count > 512)
-            {
-                _cache.Remove(_cache.MinBy(pair => pair.Value.ExpiresAt).Key);
-            }
-        }
-    }
-
     private async Task<JsonNode?> QueryAsync(IReadOnlyList<string> args, CancellationToken ct)
     {
         var output = await InvokeAsync(args, false, ct);
@@ -1033,11 +724,7 @@ internal sealed class AzureDevOps
     private static bool IsProviderFailure(Exception exception, CancellationToken ct) =>
         !ct.IsCancellationRequested && exception is AzureDevOpsException or Win32Exception or IOException or JsonException
             or InvalidOperationException or FormatException or TimeoutException or OperationCanceledException;
-    private static bool OptionalFailure(AzureDevOpsException error) => error.Code is "az_cli_missing" or "az_cli_unsupported" or "azdo_extension_missing";
     private static AzureDevOpsException Error(string code, string message) => new(code, message);
-    private sealed record CacheEntry(JsonNode? Value, DateTimeOffset ExpiresAt);
-    private sealed record Association(string GitHub, JsonObject Azure);
-    private sealed record Inspection(JsonObject? Definition, string? Warning, AzureDevOpsException? Failure);
 }
 
 internal static class HealthText

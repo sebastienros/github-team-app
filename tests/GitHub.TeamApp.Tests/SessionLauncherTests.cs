@@ -5,7 +5,7 @@ using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.WebUtilities;
 using Xunit;
 
-namespace Aspire.TeamApp.Tests;
+namespace GitHub.TeamApp.Tests;
 
 public class SessionLauncherTests
 {
@@ -161,8 +161,7 @@ public class SessionLauncherTests
         Assert.False(configuration["capabilities"].Flag("projectDiscovery"));
         Assert.False(configuration["capabilities"].Flag("currentSession"));
         Assert.False(configuration["capabilities"].Flag("cli"));
-        Assert.Equal(new[] { "https://github.com/microsoft/aspire", "https://github.com/devdiv-microsoft/aspire-1p" },
-            configuration["suggestedProjects"].Objects().Select(p => p.Text("repositoryUrl")));
+        Assert.Empty(configuration["suggestedProjects"].Objects());
     }
 
     [Theory]

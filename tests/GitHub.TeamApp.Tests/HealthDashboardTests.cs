@@ -1,14 +1,13 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
-using System.Collections.Concurrent;
 using System.Net;
 using System.Text;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
-namespace Aspire.TeamApp.Tests;
+namespace GitHub.TeamApp.Tests;
 
 public class HealthDashboardTests
 {
@@ -224,10 +223,10 @@ public class HealthDashboardTests
     }
 
     [Fact]
-    public async Task DashboardRetainsGitHubWhenOptionalAzureCliIsMissing()
+    public async Task DashboardDoesNotDiscoverAzurePipelinesForGitHubRepositories()
     {
         using var http = Http(_ => Task.FromResult(Data(GitHubRepository("microsoft/aspire", "SUCCESS"))));
-        var azure = Azure((_, _, _) => throw new AzureDevOpsException("az_cli_missing", "Azure CLI is not installed or is not available on PATH."));
+        var azure = Azure((_, _, _) => throw new InvalidOperationException("Unconfigured Azure providers must not be queried."));
         var result = await Dashboard(http, azure).LoadAsync([Account("microsoft/aspire")], new JsonObject(), CancellationToken);
         Assert.True(result.Flag("authenticated"));
         Assert.False(result.Flag("loading"));
@@ -236,8 +235,91 @@ public class HealthDashboardTests
         Assert.Equal(1, result["health"]!["counts"].Number("healthy"));
         Assert.Equal(["github"], result["health"]!["items"].Objects().Select(i => i.Text("provider")));
         Assert.Empty(result["errors"].Strings());
-        Assert.Equal(["az_cli_missing", "az_cli_missing"],
-            result["health"]!["providers"].Objects().Where(p => p.Text("provider") == "azure-devops").Select(p => p.Text("code")));
+        Assert.Equal(["not_configured"],
+            result["health"]!["providers"].Objects().Where(p => p.Text("provider") == "azure-devops").Select(p => p.Text("status")));
+    }
+
+    [Theory]
+    [InlineData("github.com")]
+    [InlineData("ghe.example.com")]
+    public async Task DashboardQueriesOnlyScopedAccountsAndRepositoriesWithoutCachedScopeLeakage(string host)
+    {
+        var requests = new List<string>();
+        using var http = new HttpClient(new Handler(async (request, ct) =>
+        {
+            var body = JsonNode.Parse(await request.Content!.ReadAsStringAsync(ct))!;
+            var repository = $"{body["variables"].Text("owner")}/{body["variables"].Text("name")}";
+            requests.Add($"{request.Headers.Authorization!.Parameter}:{repository}");
+            Assert.Equal(host == "github.com" ? "https://api.github.com/graphql" : $"https://{host}/api/graphql", request.RequestUri!.AbsoluteUri);
+            var repo = GitHubRepository(repository, "SUCCESS");
+            repo["url"] = $"https://{host}/{repository}";
+            return Response(Data(repo));
+        }));
+        var azure = Azure((_, _, _) => throw new InvalidOperationException("No Azure discovery expected."));
+        var dashboard = Dashboard(http, azure);
+        foreach (var repository in new[] { "contoso/widgets", "fabrikam/tools" })
+        {
+            var account = Account(repository) with { Host = host, Token = repository };
+            var result = await dashboard.LoadAsync(
+                [account, Account("ignored/inactive") with { Active = false }, Account("ignored/no-token") with { Token = "" }],
+                new JsonObject(), CancellationToken);
+            var item = Assert.Single(result["health"]!["items"].Objects());
+            Assert.Equal(repository, item.Text("repository"));
+            Assert.Equal([repository], result["repos"].Strings());
+            Assert.Equal(["octo"], result["viewers"].Strings());
+            Assert.Empty(result["errors"].Strings());
+        }
+        Assert.Equal(["contoso/widgets:contoso/widgets", "fabrikam/tools:fabrikam/tools"], requests);
+    }
+
+    [Fact]
+    public async Task EmptyRepositorySelectionAndMissingTokensDoNotMonitorAnything()
+    {
+        using var http = Http(_ => throw new InvalidOperationException("No GitHub queries expected."));
+        var azure = Azure((_, _, _) => throw new InvalidOperationException("No Azure queries expected."));
+        var dashboard = Dashboard(http, azure);
+        var emptySelection = await dashboard.LoadAsync([Account()], new JsonObject(), CancellationToken);
+        Assert.Empty(emptySelection["repos"].Strings());
+        Assert.Empty(emptySelection["health"]!["items"].Objects());
+        var noToken = await dashboard.LoadAsync([Account("contoso/widgets") with { Token = "" }], new JsonObject(), CancellationToken);
+        Assert.False(noToken.Flag("authenticated"));
+        Assert.Empty(noToken["health"]!["items"].Objects());
+    }
+
+    [Theory]
+    [InlineData("other/repo", "https://github.com/other/repo")]
+    [InlineData("contoso/widgets", "https://ghe.example.com/contoso/widgets")]
+    [InlineData("contoso/widgets", "https://github.com/contoso/widgets-extra")]
+    public async Task ForeignGitHubRepositoryResponsesRemainExplicitFailures(string name, string url)
+    {
+        var repo = GitHubRepository(name, "SUCCESS");
+        repo["url"] = url;
+        using var http = Http(_ => Task.FromResult(Data(repo)));
+        var result = await Dashboard(http).LoadAsync([Account("contoso/widgets")], new JsonObject(), CancellationToken);
+        Assert.Empty(result["health"]!["items"].Objects());
+        Assert.Equal(["contoso/widgets: GitHub returned a different repository than requested"], result["errors"].Strings());
+        Assert.Equal("unavailable", result["providers"].Objects().First().Text("status"));
+    }
+
+    [Fact]
+    public async Task ForeignAssociatedPullRequestsCannotBecomeRegressionEvidence()
+    {
+        var repo = GitHubRepository("contoso/widgets", "FAILURE");
+        repo["defaultBranchRef"]!["head"]!["associatedPullRequests"]!["nodes"] = JsonData.Array(
+            new[] { "https://github.com/other/repo/pull/1", "https://ghe.example.com/contoso/widgets/pull/1", "https://github.com/contoso/widgets-extra/pull/1" }
+                .Select(url => new JsonObject
+                {
+                    ["number"] = 1,
+                    ["url"] = url,
+                    ["mergedAt"] = "2026-08-06T11:59:00Z",
+                    ["author"] = new JsonObject { ["login"] = "dependabot[bot]" },
+                    ["autoMergeRequest"] = new JsonObject { ["enabledAt"] = "2026-08-06T11:00:00Z" }
+                }));
+        using var http = Http(_ => Task.FromResult(Data(repo)));
+        var item = await Dashboard(http).LoadGitHubRepositoryAsync(Account("contoso/widgets"), "contoso/widgets", s_now, CancellationToken);
+        Assert.Null(item["linkedPullRequest"]);
+        Assert.DoesNotContain("dependabot_auto_merge", Codes(item));
+        Assert.Empty(item["evidence"].Objects());
     }
 
     [Fact]
@@ -357,12 +439,8 @@ public class HealthDashboardTests
     }
 
     [Fact]
-    public void DefaultsParsingAndRemovalKeysAreStable()
+    public void PipelineRemovalKeysAreStable()
     {
-        var parsed = AzureDevOps.ParseDefaults("[defaults]\norganization = https://dev.azure.com/dnceng\nproject = aspire-msft\n\nUse git alias = No");
-        Assert.Equal("https://dev.azure.com/dnceng", parsed.Text("organization"));
-        Assert.Equal("aspire-msft", parsed.Text("project"));
-        Assert.Null(AzureDevOps.ParseDefaults("[defaults]\norganization = https://example.com/org\nproject = docs"));
         const string id = "azdo:dnceng/other project/1602";
         var key = AzureDevOps.RemovalKey(id);
         Assert.Equal("azp1_YXpkbzpkbmNlbmcvb3RoZXIgcHJvamVjdC8xNjAy", key);
@@ -407,101 +485,7 @@ public class HealthDashboardTests
     }
 
     [Fact]
-    public async Task DiscoversAllCuratedOfficialPipelinesInOrderAndCachesThem()
-    {
-        var calls = new ConcurrentBag<string[]>();
-        var definitions = OfficialDefinitions();
-        var azure = Azure((args, text, _) =>
-        {
-            calls.Add(args.ToArray());
-            if (text)
-            {
-                return Task.FromResult("[defaults]\n");
-            }
-            return Output(args[1] == "list" ? JsonData.Array(definitions) : definitions.Single(d => d.Number("id") == int.Parse(Argument(args, "--id"), System.Globalization.CultureInfo.InvariantCulture)));
-        });
-        var first = await azure.DiscoverAsync(["microsoft/aspire"], CancellationToken);
-        var second = await azure.DiscoverAsync(["microsoft/aspire"], CancellationToken);
-        Assert.Equal([1599, 1600, 1602], first["pipelines"].Objects().Select(p => p.Number("definitionId")));
-        Assert.All(first["pipelines"].Objects(), p =>
-        {
-            Assert.True(p.Flag("discovered"));
-            Assert.Equal("official-default", p["discovery"].Text("kind"));
-            Assert.Equal("microsoft/aspire", p["discovery"].Text("repository"));
-            Assert.Equal("microsoft-aspire", p["discovery"].Text("azureRepository"));
-        });
-        Assert.Empty(first["warnings"].Strings());
-        Assert.True(JsonNode.DeepEquals(first, second));
-        Assert.Equal(5, calls.Count);
-        var list = Assert.Single(calls, c => c[1] == "list");
-        Assert.Equal("microsoft-aspire", Argument(list, "--repository"));
-        Assert.Equal("internal", Argument(list, "--project"));
-    }
-
-    [Fact]
-    public async Task DefaultDiscoveryChoosesProductionOverAuxiliaryBuildAndTestPipelines()
-    {
-        var definitions = new[]
-        {
-            Definition(1559, "aspireDev-MergeChangesFromPublic", "repo-docs", "aspire.dev", "refs/heads/deploy"),
-            Definition(1564, "Aspire.Dev-Build", "repo-docs", "aspire.dev", "refs/heads/deploy"),
-            Definition(1573, "Aspire.Dev-Release-Test", "repo-docs", "aspire.dev", "refs/heads/deploy"),
-            Definition(1576, "Aspire.Dev-Release-Production", "repo-docs", "aspire.dev", "refs/heads/deploy"),
-            Definition(1999, "Restricted pipeline", "repo-docs", "aspire.dev", "refs/heads/deploy")
-        };
-        var calls = new ConcurrentBag<string[]>();
-        var azure = Azure((args, text, _) =>
-        {
-            calls.Add(args.ToArray());
-            if (text)
-            {
-                return Task.FromResult("[defaults]\norganization = https://dev.azure.com/dnceng\nproject = aspire-msft\n");
-            }
-            if (args[0] == "repos")
-            {
-                return Output(new JsonArray(new JsonObject { ["id"] = "repo-docs", ["name"] = "aspire.dev" }));
-            }
-            if (args[1] == "list")
-            {
-                return Output(JsonData.Array(definitions));
-            }
-            var id = int.Parse(Argument(args, "--id"), System.Globalization.CultureInfo.InvariantCulture);
-            return id == 1999 ? throw new AzureDevOpsException("azdo_access_denied", "Access denied.")
-                : Output(definitions.Single(d => d.Number("id") == id));
-        });
-        var first = await azure.DiscoverAsync(["microsoft/aspire.dev"], CancellationToken);
-        var second = await azure.DiscoverAsync(["microsoft/aspire.dev"], CancellationToken);
-        var pipeline = Assert.Single(first["pipelines"].Objects());
-        Assert.Equal(1576, pipeline.Number("definitionId"));
-        Assert.Equal("refs/heads/deploy", pipeline.Text("branch"));
-        Assert.Equal("azure-cli-default", pipeline["discovery"].Text("kind"));
-        Assert.Equal(3, pipeline["discovery"].Number("pipelineCandidates"));
-        Assert.Equal(["Pipeline 1999 could not be inspected: Access denied."], first["warnings"].Strings());
-        Assert.True(JsonNode.DeepEquals(first, second));
-        Assert.Equal(8, calls.Count);
-    }
-
-    [Fact]
-    public async Task DefaultDiscoveryAvoidsAmbiguousRepositoryMatches()
-    {
-        var lists = 0;
-        var azure = Azure((args, text, _) =>
-        {
-            if (text)
-            {
-                return Task.FromResult("[defaults]\norganization = https://dev.azure.com/dnceng\nproject = test\n");
-            }
-            lists++;
-            Assert.Equal("repos", args[0]);
-            return Output(new JsonArray(new JsonObject { ["id"] = "repo", ["name"] = "aspire" }));
-        });
-        var result = await azure.DiscoverAsync(["org/aspire", "contoso/aspire"], CancellationToken);
-        Assert.Empty(result["pipelines"].Objects());
-        Assert.Equal(1, lists);
-    }
-
-    [Fact]
-    public async Task DiscoveryBoundsAllCliCallsAcrossRepositoryFanout()
+    public async Task ConfiguredPipelinesBoundConcurrentCliCallsWithoutDiscovery()
     {
         var definitions = Enumerable.Range(0, 8).Select(i => Definition(2000 + i, $"Repo {i} Release Production", $"repo-{i}", $"repo-{i}")).ToArray();
         var active = 0;
@@ -509,18 +493,13 @@ public class HealthDashboardTests
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var azure = Azure(async (args, text, ct) =>
         {
-            if (text)
+            Assert.False(text);
+            Assert.Equal("pipelines", args[0]);
+            if (args[1] == "build")
             {
-                return "[defaults]\norganization = https://dev.azure.com/dnceng\nproject = test\n";
+                return new JsonArray(Build(42, "succeeded")).ToJsonString();
             }
-            if (args[0] == "repos")
-            {
-                return JsonData.Array(definitions.Select(d => d["repository"]!.AsObject())).ToJsonString();
-            }
-            if (args[1] == "list")
-            {
-                return new JsonArray(definitions.Single(d => d["repository"].Text("id") == Argument(args, "--repository")).DeepClone()).ToJsonString();
-            }
+            Assert.Equal("show", args[1]);
             var count = Interlocked.Increment(ref active);
             InterlockedExtensionsMax(ref maximum, count);
             if (count == 6)
@@ -531,8 +510,11 @@ public class HealthDashboardTests
             Interlocked.Decrement(ref active);
             return definitions.Single(d => d.Number("id").ToString(System.Globalization.CultureInfo.InvariantCulture) == Argument(args, "--id")).ToJsonString();
         });
-        var result = await azure.DiscoverAsync(Enumerable.Range(0, 8).Select(i => $"microsoft/repo-{i}").ToArray(), CancellationToken);
-        Assert.Equal(8, result["pipelines"].Objects().Count());
+        var results = await Task.WhenAll(definitions.Select(definition => azure.LoadPipelineHealthAsync(
+            new JsonObject { ["url"] = $"https://dev.azure.com/contoso/product/_build?definitionId={definition.Number("id")}" },
+            s_now, CancellationToken)));
+        Assert.Equal(8, results.Length);
+        Assert.All(results, result => Assert.Equal("healthy", result.Text("state")));
         Assert.Equal(6, maximum);
     }
 
@@ -540,77 +522,51 @@ public class HealthDashboardTests
     [InlineData("az_cli_missing")]
     [InlineData("azdo_auth_required")]
     [InlineData("azdo_access_denied")]
-    public async Task OptionalOfficialDiscoveryExposesStatusWithoutNoisyWarnings(string code)
+    [InlineData("azdo_query_failed")]
+    public async Task ConfiguredPipelineFailuresAreReportedWithoutDiscoveryFallback(string code)
     {
         var count = 0;
-        var azure = Azure((_, text, _) =>
+        var azure = Azure((args, text, _) =>
         {
-            if (text)
-            {
-                return Task.FromResult("[defaults]\n");
-            }
+            Assert.False(text);
+            Assert.Equal("pipelines", args[0]);
+            Assert.Equal("show", args[1]);
+            Assert.Equal("1602", Argument(args, "--id"));
             Interlocked.Increment(ref count);
             throw new AzureDevOpsException(code, "Expected unavailable credential.");
         });
-        var first = await azure.DiscoverAsync(["microsoft/aspire"], CancellationToken);
-        var second = await azure.DiscoverAsync(["microsoft/aspire"], CancellationToken);
-        Assert.Empty(first["pipelines"].Objects());
-        Assert.Empty(first["warnings"].Strings());
-        Assert.Equal(code, first["providers"].Objects().First().Text("code"));
-        Assert.Equal("unavailable", first["providers"].Objects().First().Text("status"));
-        Assert.True(JsonNode.DeepEquals(first, second));
+        using var http = Http(_ => throw new InvalidOperationException("No GitHub query expected."));
+        var result = await Dashboard(http, azure).LoadAsync([], new JsonObject { ["azurePipelines"] = new JsonArray(Pipeline()) }, CancellationToken);
+        var item = Assert.Single(result["health"]!["items"].Objects());
+        Assert.Equal("unavailable", item.Text("state"));
+        Assert.Equal([code], Codes(item));
+        Assert.Equal("unavailable", result["providers"].Objects().Single(provider => provider.Text("provider") == "azure-devops").Text("status"));
         Assert.Equal(1, count);
     }
 
-    [Fact]
-    public async Task DefaultDiscoveryFailureKeepsOfficialPipelinesAndInspectionFailureIsNotMissing()
+    [Theory]
+    [InlineData("")]
+    [InlineData("contoso")]
+    public async Task MissingPipelineCoordinatesNeverFallBackToAzureCliDefaults(string organization)
     {
-        var definitions = OfficialDefinitions();
-        var azure = Azure((args, text, _) =>
-        {
-            if (text)
-            {
-                return Task.FromResult("[defaults]\norganization = https://dev.azure.com/dnceng\nproject = other\n");
-            }
-            if (args[0] == "repos")
-            {
-                throw new AzureDevOpsException("azdo_query_failed", "Default project discovery failed.");
-            }
-            if (args[1] == "list")
-            {
-                return Output(JsonData.Array(definitions));
-            }
-            var id = int.Parse(Argument(args, "--id"), System.Globalization.CultureInfo.InvariantCulture);
-            return id == 1602 ? throw new AzureDevOpsException("azdo_timeout", "The Azure DevOps query timed out.")
-                : Output(definitions.Single(d => d.Number("id") == id));
-        });
-        var result = await azure.DiscoverAsync(["microsoft/aspire"], CancellationToken);
-        Assert.Equal([1599, 1600], result["pipelines"].Objects().Select(p => p.Number("definitionId")));
-        Assert.Equal(
-        [
-            "Official pipeline 1602 could not be inspected: The Azure DevOps query timed out.",
-            "Azure CLI default project pipelines could not be discovered: Default project discovery failed."
-        ], result["warnings"].Strings());
+        var azure = Azure((_, _, _) => throw new InvalidOperationException("No Azure query before validating explicit coordinates."));
+        var error = await Assert.ThrowsAsync<AzureDevOpsException>(() => azure.LoadPipelineHealthAsync(
+            new JsonObject { ["organizationName"] = organization, ["definitionId"] = 42 }, s_now, CancellationToken));
+        Assert.Equal("invalid_pipeline_url", error.Code);
     }
 
     [Fact]
-    public async Task DashboardDeduplicatesExplicitPipelinesAndGroupsCuratedMirrors()
+    public async Task DashboardLoadsOnlyExplicitPipelinesWithoutDiscoveringCuratedMirrors()
     {
-        var definitions = OfficialDefinitions();
         var buildLists = 0;
         var azure = Azure((args, text, _) =>
         {
-            if (text)
-            {
-                return Task.FromResult("[defaults]\n");
-            }
-            if (args[1] == "list")
-            {
-                return Output(JsonData.Array(definitions));
-            }
+            Assert.False(text);
+            Assert.False(args[1] == "list");
             if (args[1] == "show")
             {
-                return Output(definitions.Single(d => d.Number("id").ToString(System.Globalization.CultureInfo.InvariantCulture) == Argument(args, "--id")));
+                Assert.Equal("1602", Argument(args, "--id"));
+                return Output(Definition());
             }
             Interlocked.Increment(ref buildLists);
             return Output(new JsonArray(Build(42, "succeeded")));
@@ -619,10 +575,93 @@ public class HealthDashboardTests
         var result = await Dashboard(http, azure).LoadAsync([Account("microsoft/aspire")],
             new JsonObject { ["azurePipelines"] = new JsonArray(Pipeline()) }, CancellationToken);
         var items = result["health"]!["items"].Objects().ToArray();
-        Assert.Equal(4, items.Length);
-        Assert.Equal(3, buildLists);
+        Assert.Equal(2, items.Length);
+        Assert.Equal(1, buildLists);
         Assert.All(items, item => Assert.Equal("repository:github.com/microsoft/aspire", item.Text("groupId")));
         Assert.False(items.Single(i => i.Text("id") == "azdo:dnceng/internal/1602").Flag("discovered"));
+    }
+
+    [Fact]
+    public async Task DashboardUsesScopedPipelinesWithoutMutatingPreferencesOrRetainingOtherScopes()
+    {
+        var calls = new List<string>();
+        var azure = Azure((args, text, _) =>
+        {
+            Assert.False(text);
+            Assert.Equal("pipelines", args[0]);
+            Assert.Contains(args[1], new[] { "show", "build" });
+            var id = Argument(args, args[1] == "show" ? "--id" : "--definition-ids");
+            calls.Add(id);
+            return Output(args[1] == "show"
+                ? Definition(int.Parse(id, System.Globalization.CultureInfo.InvariantCulture), $"Pipeline {id}", $"repo-{id}", $"widgets-{id}")
+                : new JsonArray(Build(42, "succeeded")));
+        });
+        using var http = Http(_ => throw new InvalidOperationException("No GitHub queries expected."));
+        var dashboard = Dashboard(http, azure);
+        foreach (var id in new[] { 42, 43 })
+        {
+            var prefs = new JsonObject
+            {
+                ["azurePipelines"] = new JsonArray(new JsonObject
+                {
+                    ["id"] = $"azdo:dnceng/internal/{id}",
+                    ["definitionId"] = id,
+                    ["url"] = $"https://dev.azure.com/dnceng/internal/_build?definitionId={id}",
+                    ["repositoryId"] = $"github:github.com/contoso/widgets-{id}"
+                })
+            };
+            var original = prefs.DeepClone();
+            var result = await dashboard.LoadAsync([], prefs, CancellationToken);
+            Assert.True(result.Flag("authenticated"));
+            Assert.Equal(id, Assert.Single(result["health"]!["items"].Objects()).Number("definitionId"));
+            Assert.Empty(result["errors"].Strings());
+            Assert.True(JsonNode.DeepEquals(original, prefs));
+        }
+        Assert.Equal(["42", "42", "43", "43"], calls);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ExplicitPipelinesUseConfiguredCoordinatesWithoutDiscoveryEvenWithLegacyProvenance(bool legacy)
+    {
+        var calls = new List<string>();
+        var azure = Azure((args, text, _) =>
+        {
+            Assert.False(text);
+            Assert.Equal("pipelines", args[0]);
+            Assert.Equal("https://dev.azure.com/contoso", Argument(args, "--organization"));
+            Assert.Equal("product", Argument(args, "--project"));
+            calls.Add(args[1]);
+            if (args[1] == "show")
+            {
+                Assert.Equal("42", Argument(args, "--id"));
+                return Output(Definition(42, "Widgets CI", "widget-id", "widgets", "refs/heads/stable"));
+            }
+            Assert.Equal("build", args[1]);
+            Assert.Equal("42", Argument(args, "--definition-ids"));
+            Assert.Equal("refs/heads/stable", Argument(args, "--branch"));
+            return Output(new JsonArray(Build(101, "succeeded")));
+        });
+        var config = new JsonObject
+        {
+            ["url"] = "https://dev.azure.com/contoso/product/_build?definitionId=42",
+            ["discovered"] = legacy,
+            ["discovery"] = legacy ? new JsonObject
+            {
+                ["kind"] = "official-default",
+                ["repository"] = "microsoft/aspire",
+                ["azureRepository"] = "microsoft-aspire",
+                ["pipelineCandidates"] = 3
+            } : null
+        };
+        var original = config.DeepClone();
+        var item = await azure.LoadPipelineHealthAsync(config, s_now, CancellationToken);
+        Assert.Equal("azdo:contoso/product/42", item.Text("id"));
+        Assert.Equal("healthy", item.Text("state"));
+        Assert.Equal(legacy, item.Flag("discovered"));
+        Assert.True(JsonNode.DeepEquals(config, original));
+        Assert.Equal(["show", "build"], calls);
     }
 
     [Fact]
@@ -786,9 +825,10 @@ public class HealthDashboardTests
     }
 
     private static Account Account(params string[] repos) => new("github:octo", "octo", "github.com", "test-token", repos, true, new JsonObject());
-    private static AzureDevOps Azure(Func<IReadOnlyList<string>, bool, CancellationToken, Task<string>> run) => new(run, new Clock());
+    private static AzureDevOps Azure(Func<IReadOnlyList<string>, bool, CancellationToken, Task<string>> run) => new(run);
     private static HealthDashboard Dashboard(HttpClient http, AzureDevOps? azure = null) =>
-        new(http, NullLogger<HealthDashboard>.Instance, azure ?? Azure((_, _, _) => Task.FromResult("[defaults]\n")), new Clock());
+        new(http, NullLogger<HealthDashboard>.Instance, azure ?? Azure((_, _, _) =>
+            throw new InvalidOperationException("No Azure pipelines configured.")), new Clock());
     private static string[] Codes(JsonObject item) => item["reasons"].Objects().Select(r => r.Text("code")).ToArray();
     private static Task<string> Output(JsonNode? node) => Task.FromResult(node?.ToJsonString() ?? "");
     private static string Argument(IReadOnlyList<string> args, string name) => args[Array.IndexOf(args.ToArray(), name) + 1];
@@ -855,14 +895,6 @@ public class HealthDashboardTests
                 ["defaultBranch"] = branch
             }
         };
-
-    private static JsonObject[] OfficialDefinitions() =>
-    [
-        Definition(1599, "microsoft-aspire-codeql"),
-        Definition(1600, "microsoft-aspire-Release-To-NuGet"),
-        Definition(1601, "microsoft-aspire-unofficial"),
-        Definition()
-    ];
 
     private static JsonObject Build(int id, string result, string at = "2026-08-06T12:00:00Z") => new()
     {

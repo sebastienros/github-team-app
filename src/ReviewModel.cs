@@ -5,12 +5,15 @@ using System.Globalization;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
-namespace Aspire.TeamApp;
+namespace GitHub.TeamApp;
 
 // Keep this engine independent of HTTP and serialization so one clock governs a complete snapshot.
-internal sealed class ReviewModel(TimeProvider? timeProvider = null)
+internal sealed class ReviewModel(TimeProvider? timeProvider = null, JsonObject? prefs = null)
 {
     private readonly DateTimeOffset _now = (timeProvider ?? TimeProvider.System).GetUtcNow();
+    private readonly string[] _teamMembers = prefs?["teamMembers"].Strings().Select(member => member.Trim())
+        .Where(member => member.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToArray() ?? [];
+    private readonly string _release = prefs.Text("release", DashboardConstants.CurrentRelease).Trim();
     private const string Regression = "Regression";
     private const string ApprovedAging = "Approved but aging";
     private const string AgedCommunity = "Aged out community";
@@ -21,7 +24,7 @@ internal sealed class ReviewModel(TimeProvider? timeProvider = null)
     [
         (Regression, "danger"), (ApprovedAging, "danger"), ("CI failing", "danger"),
         ("Merge conflicts", "danger"), ("Unresolved feedback", "danger"), ("Ready to merge", "success"),
-        ("Re-review needed", "warning"), ("Docs", "accent"), ("Community Toolkit", "accent"),
+        ("Re-review needed", "warning"), ("Docs", "accent"),
         ("Bots / automation", "accent"), (AgedCommunity, "warning"), ("Quick wins", "success"),
         ("Needs review", "warning"), ("Review started", "accent"), ("Stalled", "warning"),
         ("Author response", "danger"), ("Draft", "accent")
@@ -29,18 +32,18 @@ internal sealed class ReviewModel(TimeProvider? timeProvider = null)
 
     private static readonly HashSet<string> s_excludedFocus =
     [
-        "Stalled", "Draft", MyDrafts, "Docs", "Community Toolkit", "Bots / automation",
+        "Stalled", "Draft", MyDrafts, "Docs", "Bots / automation",
         "Community", AgedCommunity, "Unresolved feedback", "Merge conflicts", "CI failing", "Author response"
     ];
 
     private static readonly HashSet<string> s_disqualifyingFocus =
     [
-        "Draft", MyDrafts, "Docs", "Community Toolkit", "Bots / automation",
+        "Draft", MyDrafts, "Docs", "Bots / automation",
         "Community", AgedCommunity, "Unresolved feedback", "Merge conflicts"
     ];
 
     private static readonly HashSet<string> s_specializedFocus =
-        ["Docs", "Community Toolkit", "Bots / automation", "Community", AgedCommunity];
+        ["Docs", "Bots / automation", "Community", AgedCommunity];
 
     private static readonly string[] s_exclusionRanks =
     [
@@ -80,28 +83,13 @@ internal sealed class ReviewModel(TimeProvider? timeProvider = null)
             author.Contains("bot", StringComparison.Ordinal) || author.EndsWith("[bot]", StringComparison.Ordinal);
     }
 
-    private static string? CoreTeamOwnershipActor(string author)
-    {
-        var direct = DashboardConstants.CoreTeamMembers.FirstOrDefault(member => SameLogin(member, author));
-        if (direct is not null)
-        {
-            return direct;
-        }
-        var suffix = DashboardConstants.CoreTeamMemberAliasSuffixes.FirstOrDefault(s =>
-            s.Length > 0 && author.Length > s.Length && author.EndsWith(s, StringComparison.OrdinalIgnoreCase));
-        if (suffix is null)
-        {
-            return null;
-        }
-        return DashboardConstants.CoreTeamMembers.FirstOrDefault(member => SameLogin(member, author[..^suffix.Length])) ?? author;
-    }
+    private string? CoreTeamOwnershipActor(string author) => _teamMembers.FirstOrDefault(member => SameLogin(member, author));
+    private bool CoreTeam(JsonObject pr) => CoreTeamOwnershipActor(pr.Text("author")) is not null;
+    // Without an explicit team, keep human contributions in the ordinary review queue.
+    private bool CommunityAuthor(JsonObject pr) => _teamMembers.Length > 0 && !IsBotAuthor(pr) && !CoreTeam(pr);
 
-    private static bool CoreTeam(JsonObject pr) => CoreTeamOwnershipActor(pr.Text("author")) is not null;
-    private static bool Toolkit(JsonObject pr) => pr.Text("repository").Equals("communitytoolkit/aspire", StringComparison.OrdinalIgnoreCase);
-    private static bool CommunityAuthor(JsonObject pr) => !IsBotAuthor(pr) && !CoreTeam(pr);
-
-    public static bool IsCommunityPullRequest(JsonObject pr) =>
-        !pr.Flag("isMine") && !pr.Flag("repoPrivate") && CommunityAuthor(pr) && !Toolkit(pr);
+    public bool IsCommunityPullRequest(JsonObject pr) =>
+        !pr.Flag("isMine") && !pr.Flag("repoPrivate") && CommunityAuthor(pr);
 
     public static string ReviewAgeStartedAt(JsonObject pr) => pr.Text("readyForReviewAt", pr.Text("createdAt"));
     private bool AgedOutCommunity(JsonObject pr) => IsCommunityPullRequest(pr) && Age(pr.Text("updatedAt")).TotalDays > 14;
@@ -110,43 +98,9 @@ internal sealed class ReviewModel(TimeProvider? timeProvider = null)
         ((Review(pr).Text("state") == "waiting" && Age(ReviewAgeStartedAt(pr)).TotalHours >= 12) ||
          (Review(pr).Text("state") == "reviewed" && Idle(pr)));
 
-    public static IEnumerable<DashboardConstants.CheckFailureRule> FilterCheckFailureRules(IEnumerable<DashboardConstants.CheckFailureRule> rules) =>
-        rules.Where(rule => rule.Repository.Length > 0 && rule.Label.Length > 0 &&
-            (rule.CheckNames.Length > 0 || rule.CheckNameContains.Length > 0));
+    public static bool IsChecksFailing(JsonObject pr) => pr["checks"].Text("state") == "failure";
 
-    private static IEnumerable<DashboardConstants.CheckFailureRule> Rules(JsonObject pr) =>
-        FilterCheckFailureRules(DashboardConstants.NonBlockingCheckFailureRules)
-            .Where(rule => rule.Repository.Equals(pr.Text("repository"), StringComparison.OrdinalIgnoreCase));
-
-    private static bool NonBlockingAggregateFailure(JsonObject pr)
-    {
-        var checks = pr["checks"];
-        return checks.Text("state") == "failure" && Rules(pr).Any() &&
-            checks.Number("totalCount") == 0 && checks.Number("failureCount") == 0 &&
-            (checks?["failingChecks"].Objects().Count() ?? 0) == 0;
-    }
-
-    private static DashboardConstants.CheckFailureRule? NonBlockingOnlyFailureRule(JsonObject pr)
-    {
-        var checks = pr["checks"];
-        var failures = checks?["failingChecks"].Objects().ToArray() ?? [];
-        if (checks.Text("state") != "failure" || failures.Length == 0 || checks.Number("failureCount") != failures.Length)
-        {
-            return null;
-        }
-        var matched = failures.Select(check => Rules(pr).FirstOrDefault(rule =>
-            rule.CheckNames.Any(name => name.Equals(check.Text("name").Trim(), StringComparison.OrdinalIgnoreCase)) ||
-            rule.CheckNameContains.Any(fragment => check.Text("name").Trim().Contains(fragment, StringComparison.OrdinalIgnoreCase)))).ToArray();
-        return matched.All(rule => rule is not null) ? matched[0] : null;
-    }
-
-    public static bool IsChecksFailing(JsonObject pr) =>
-        pr["checks"].Text("state") == "failure" && !NonBlockingAggregateFailure(pr) && NonBlockingOnlyFailureRule(pr) is null;
-
-    public static string VisibleCheckState(JsonObject pr) =>
-        NonBlockingAggregateFailure(pr) ? "unknown" :
-        NonBlockingOnlyFailureRule(pr) is null ? pr["checks"].Text("state", "none") :
-        pr["checks"].Number("pendingCount") > 0 ? "pending" : "success";
+    public static string VisibleCheckState(JsonObject pr) => pr["checks"].Text("state", "none");
 
     public static bool HasMergeConflicts(JsonObject pr) => pr.Text("mergeableState") == "dirty";
     public static bool IsMergeReviewBlocked(JsonObject pr) => pr.Text("reviewDecision") is "REVIEW_REQUIRED" or "CHANGES_REQUESTED";
@@ -159,9 +113,10 @@ internal sealed class ReviewModel(TimeProvider? timeProvider = null)
     private static bool ChecksPending(JsonObject pr) => VisibleCheckState(pr) is "pending" or "unknown";
     private bool Idle(JsonObject pr) => Age(pr.Text("updatedAt")).TotalDays >= 7;
     private static bool RegressionLabels(JsonObject item) => item["labels"].Strings().Any(label => label.Contains("regression", StringComparison.OrdinalIgnoreCase));
-    private static bool RegressionSignal(JsonObject pr) => RegressionLabels(pr) || pr["linkedIssues"].Objects().Any(RegressionLabels);
-    private static bool GeneratedDocs(JsonObject pr) => pr.Text("repository").Equals("microsoft/aspire.dev", StringComparison.OrdinalIgnoreCase) &&
-        pr["labels"].Strings().Contains("docs-from-code", StringComparer.OrdinalIgnoreCase);
+    private static IEnumerable<JsonObject> LinkedIssues(JsonObject pr) => pr["linkedIssues"].Objects()
+        .Where(issue => issue.Text("repository").Equals(pr.Text("repository"), StringComparison.OrdinalIgnoreCase));
+    private static bool RegressionSignal(JsonObject pr) => RegressionLabels(pr) || LinkedIssues(pr).Any(RegressionLabels);
+    private static bool GeneratedDocs(JsonObject pr) => pr["labels"].Strings().Contains("docs-from-code", StringComparer.OrdinalIgnoreCase);
     private static string ApprovalAgeAt(JsonObject pr) => Review(pr).Text("lastApprovedAt", Review(pr).Text("lastReviewedAt"));
     private bool ApprovedButAging(JsonObject pr) => Review(pr).Text("state") == "approved" &&
         ApprovalAgeAt(pr).Length > 0 && Age(ApprovalAgeAt(pr)).TotalDays >= 2;
@@ -170,24 +125,24 @@ internal sealed class ReviewModel(TimeProvider? timeProvider = null)
         Review(pr).Text("state") is "reviewed" or "changes_requested" &&
         pr.Date("lastCommitAt") is { } committed && Review(pr).Date("lastReviewedAt") is { } reviewed && committed > reviewed;
 
-    private static bool ReleaseMatches(string value) => Regex.IsMatch(value,
-        $@"(^|[^0-9]){Regex.Escape(DashboardConstants.CurrentRelease)}([^0-9]|$)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    private bool ReleaseMatches(string value) => _release.Length > 0 && Regex.IsMatch(value,
+        $@"(^|[^0-9]){Regex.Escape(_release)}([^0-9]|$)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
-    private static bool TargetsReleaseIssue(JsonObject item) =>
+    private bool TargetsReleaseIssue(JsonObject item) =>
         new[] { item.Text("title"), item.Text("milestone") }.Concat(item["labels"].Strings()).Any(ReleaseMatches);
-    private static bool TargetsRelease(JsonObject pr) => TargetsReleaseIssue(pr) || pr["linkedIssues"].Objects().Any(TargetsReleaseIssue);
+    private bool TargetsRelease(JsonObject pr) => TargetsReleaseIssue(pr) || LinkedIssues(pr).Any(TargetsReleaseIssue);
 
     private bool QuickWin(JsonObject pr)
     {
         var lines = pr.Number("additions") + pr.Number("deletions");
         return Review(pr).Text("state") == "waiting" && !Unresolved(pr) && !HasMergeConflicts(pr) &&
-            CoreTeam(pr) && !TargetsRelease(pr) && pr["linkedIssues"].Objects().Count() <= 1 &&
+            !IsBotAuthor(pr) && !CommunityAuthor(pr) && !TargetsRelease(pr) && LinkedIssues(pr).Count() <= 1 &&
             pr.Number("commitCount") <= 2 && pr.Number("changedFiles") is > 0 and <= 3 &&
             lines is > 0 and <= 80 && !Idle(pr);
     }
 
-    private static bool NeedsReview(JsonObject pr) =>
-        Review(pr).Text("state") == "waiting" && !Unresolved(pr) && !HasMergeConflicts(pr) && CoreTeam(pr);
+    private bool NeedsReview(JsonObject pr) =>
+        Review(pr).Text("state") == "waiting" && !Unresolved(pr) && !HasMergeConflicts(pr) && !IsBotAuthor(pr) && !CommunityAuthor(pr);
 
     private List<string> ReviewBucketLabels(JsonObject pr)
     {
@@ -214,11 +169,6 @@ internal sealed class ReviewModel(TimeProvider? timeProvider = null)
         if (GeneratedDocs(pr))
         {
             labels.Add("Docs");
-        }
-
-        if (Toolkit(pr))
-        {
-            labels.Add("Community Toolkit");
         }
 
         if (IsChecksFailing(pr))
@@ -301,7 +251,6 @@ internal sealed class ReviewModel(TimeProvider? timeProvider = null)
             "Re-review needed" => pr.Text("lastCommitAt").Length > 0 ? $"Pushed {FormatAge(pr.Text("lastCommitAt"))}" : "Pushed after review",
             "Merge conflicts" => "Merge conflicts",
             "Docs" => "generated docs",
-            "Community Toolkit" => "CommunityToolkit/Aspire",
             "Bots / automation" => "bot",
             "Community" => CommunityWaiting(pr) ? $"Community{Separator}waiting {FormatAge(ReviewAgeStartedAt(pr))}" : "community",
             AgedCommunity => AgedCommunity,
@@ -338,7 +287,7 @@ internal sealed class ReviewModel(TimeProvider? timeProvider = null)
 
         if (TargetsRelease(pr))
         {
-            signals.Add(Signal($"release {DashboardConstants.CurrentRelease}", "danger"));
+            signals.Add(Signal($"release {_release}", "danger"));
         }
 
         if (RegressionSignal(pr))
@@ -374,11 +323,6 @@ internal sealed class ReviewModel(TimeProvider? timeProvider = null)
         if (GeneratedDocs(pr))
         {
             signals.Add(Signal("docs", "accent"));
-        }
-
-        if (Toolkit(pr))
-        {
-            signals.Add(Signal("community toolkit", "accent"));
         }
 
         if (AgedOutCommunity(pr))
@@ -442,13 +386,9 @@ internal sealed class ReviewModel(TimeProvider? timeProvider = null)
     private static JsonObject? ChecksAttentionSignal(JsonObject pr)
     {
         var checks = pr["checks"];
-        if (checks is null || checks.Text("state") is "none" or "unknown" || NonBlockingAggregateFailure(pr))
+        if (checks is null || checks.Text("state") is "none" or "unknown")
         {
             return null;
-        }
-        if (NonBlockingOnlyFailureRule(pr) is { } rule)
-        {
-            return Signal(rule.Label, "warning");
         }
         return checks.Text("state") switch
         {
@@ -525,11 +465,6 @@ internal sealed class ReviewModel(TimeProvider? timeProvider = null)
         if (GeneratedDocs(pr))
         {
             return Signal("docs review", "accent");
-        }
-
-        if (Toolkit(pr))
-        {
-            return Signal("toolkit review", "accent");
         }
 
         if (IsChecksFailing(pr))
@@ -891,10 +826,10 @@ internal sealed class ReviewModel(TimeProvider? timeProvider = null)
         return string.Join(Separator, signals);
     }
 
-    public static IReadOnlyList<JsonObject> CreateDeveloperPullRequestCounts(IReadOnlyList<JsonObject> prs)
+    public IReadOnlyList<JsonObject> CreateDeveloperPullRequestCounts(IReadOnlyList<JsonObject> prs)
     {
         var byDeveloper = new Dictionary<string, (string Actor, List<JsonObject> Prs)>();
-        foreach (var pr in prs.Where(pr => pr.Text("state") == "open" && !Toolkit(pr) && !ShouldHideFromSharedPullRequestLists(pr)))
+        foreach (var pr in prs.Where(pr => pr.Text("state") == "open" && !IsBotAuthor(pr) && !ShouldHideFromSharedPullRequestLists(pr)))
         {
             var owner = CoreTeamOwnershipActor(pr.Text("author"));
             if (owner is null)
@@ -917,22 +852,11 @@ internal sealed class ReviewModel(TimeProvider? timeProvider = null)
             .ThenBy(item => item.Text("actor"), StringComparer.InvariantCulture).ToArray();
     }
 
-    private static bool CtiIssue(JsonObject issue) => issue.Text("title").Contains("[aspiree2e]", StringComparison.OrdinalIgnoreCase);
     private static IEnumerable<(string Label, string Tone)> IssueDefinitions(JsonObject issue)
     {
         if (RegressionLabels(issue))
         {
             yield return (Regression, "danger");
-        }
-
-        if (CtiIssue(issue))
-        {
-            yield return ("CTI team", "warning");
-        }
-
-        if (SameLogin(issue.Text("author"), "afscrome"))
-        {
-            yield return ("afscrome finds", "success");
         }
     }
 
@@ -940,9 +864,7 @@ internal sealed class ReviewModel(TimeProvider? timeProvider = null)
     {
         var definitions = new List<(string Label, string Tone, Func<JsonObject, bool> Match)>
         {
-            (Regression, "danger", RegressionLabels),
-            ("CTI team", "warning", CtiIssue),
-            ("afscrome finds", "success", issue => SameLogin(issue.Text("author"), "afscrome"))
+            (Regression, "danger", RegressionLabels)
         };
         if (!string.IsNullOrEmpty(login))
         {
@@ -962,7 +884,7 @@ internal sealed class ReviewModel(TimeProvider? timeProvider = null)
         var signals = new List<JsonObject> { action };
         if (TargetsReleaseIssue(issue))
         {
-            signals.Add(Signal($"release {DashboardConstants.CurrentRelease}", "danger"));
+            signals.Add(Signal($"release {_release}", "danger"));
         }
         // linkedPullRequests includes merged fixes, not an authoritative complete open-PR count.
         // Only use linkedOpenPullRequests when explicitly supplied, matching the original model.
@@ -977,18 +899,18 @@ internal sealed class ReviewModel(TimeProvider? timeProvider = null)
             signals.Add(Signal(definition.Label, definition.Tone));
         }
 
-        if (linkedCount == 0 && !CtiIssue(issue))
+        if (linkedCount == 0)
         {
             signals.Add(Signal("Needs PR", "danger"));
         }
 
         var searchText = $" {string.Join(" ", new[] { issue.Text("title"), issue.Text("author") }.Concat(issue["labels"].Strings())).ToLowerInvariant()} ";
-        if (CtiIssue(issue) || linkedCount > 0 ||
+        if (linkedCount > 0 ||
             new[] { "validation", "validate", "verify", "verification", "test", "e2e", "servicing validation" }.Any(term => searchText.Contains(term, StringComparison.Ordinal)))
         {
             signals.Add(Signal("Needs validation", "warning"));
         }
-        var domainMatch = CtiIssue(issue);
+        var domainMatch = false;
         foreach (var (label, tone, terms) in s_issueDomains)
         {
             if (terms.Any(term => searchText.Contains(term, StringComparison.Ordinal)))

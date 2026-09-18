@@ -3,7 +3,7 @@
 
 using System.Diagnostics;
 
-namespace Aspire.TeamApp;
+namespace GitHub.TeamApp;
 
 internal sealed record ProcessResult(int ExitCode, string StandardOutput, string StandardError);
 

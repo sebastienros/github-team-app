@@ -4,7 +4,7 @@
 using System.Globalization;
 using System.Text.Json.Nodes;
 
-namespace Aspire.TeamApp;
+namespace GitHub.TeamApp;
 
 internal static class JsonData
 {

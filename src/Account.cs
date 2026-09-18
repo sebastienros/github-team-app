@@ -3,7 +3,7 @@
 
 using System.Text.Json.Nodes;
 
-namespace Aspire.TeamApp;
+namespace GitHub.TeamApp;
 
 internal sealed record Account(
     string Id,

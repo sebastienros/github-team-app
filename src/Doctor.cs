@@ -6,7 +6,7 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
-namespace Aspire.TeamApp;
+namespace GitHub.TeamApp;
 
 internal delegate Task<ProcessResult> DoctorProcessRunner(
     string fileName,
@@ -50,7 +50,7 @@ internal static partial class Doctor
         }
         else
         {
-            await output.WriteLineAsync("Aspire Team App doctor".AsMemory(), ct).ConfigureAwait(false);
+            await output.WriteLineAsync("GitHub Team App doctor".AsMemory(), ct).ConfigureAwait(false);
             foreach (var check in result["checks"].Objects())
             {
                 var required = check.Flag("required") ? "required" : "optional";
@@ -77,7 +77,7 @@ internal static partial class Doctor
         {
             return Summary(new JsonArray(Check("preferences", "Preferences", true, "failed",
                 "Preferences could not be read, so required provider checks cannot be determined.",
-                "Correct the preferences JSON or its file permissions in ASPIRE_TEAM_APP_HOME (or the default TeamApp data directory), then rerun doctor.")));
+                "Correct the preferences JSON or its file permissions in GITHUB_TEAM_APP_HOME (or the default TeamApp data directory), then rerun doctor.")));
         }
         return await CheckAsync(prefs, ct).ConfigureAwait(false);
     }
@@ -90,8 +90,8 @@ internal static partial class Doctor
     {
         ct.ThrowIfCancellationRequested();
         var groups = await Task.WhenAll(
-            CheckGitHubAsync(processRunner, ct),
-            CheckAzureAsync(prefs, processRunner, ct),
+            CheckGitHubAsync(RepositoryCatalog.Selected(prefs).Text("host", "github.com"), processRunner, ct),
+            CheckAzureAsync(prefs.ContainsKey("repositories") ? RepositoryCatalog.ScopePreferences(prefs) : prefs, processRunner, ct),
             CheckToolAsync("git", "Git", required: false, ["--version"],
                 "Git is available. The GitHub App manages session workspaces.",
                 "Install Git if the GitHub App needs to create local repository workspaces.", processRunner, ct),
@@ -109,7 +109,7 @@ internal static partial class Doctor
         return Summary(checks);
     }
 
-    private static async Task<JsonObject[]> CheckGitHubAsync(DoctorProcessRunner runner, CancellationToken ct)
+    private static async Task<JsonObject[]> CheckGitHubAsync(string host, DoctorProcessRunner runner, CancellationToken ct)
     {
         var tools = await CheckToolAsync("gh", "GitHub CLI", true, ["--version"], "GitHub CLI is installed.",
             "Install GitHub CLI from https://cli.github.com/ and ensure gh is on PATH.", runner, ct).ConfigureAwait(false);
@@ -117,14 +117,14 @@ internal static partial class Doctor
         {
             return [.. tools, Check("github-auth", "GitHub authentication", true, "failed",
                 "Authentication could not be checked because GitHub CLI is unavailable.",
-                "After installing gh, run gh auth login --hostname github.com, then rerun doctor.")];
+                $"After installing gh, run gh auth login --hostname {host}, then rerun doctor.")];
         }
         // gh auth status validates the active account without printing a token. Never copy
         // CLI stdout/stderr into the report: other tools can include credentials in errors.
-        var auth = await ProbeAsync("gh", ["auth", "status", "--active", "--hostname", "github.com"], runner, ct).ConfigureAwait(false);
+        var auth = await ProbeAsync("gh", ["auth", "status", "--active", "--hostname", host], runner, ct).ConfigureAwait(false);
         return [.. tools, Check("github-auth", "GitHub authentication", true, auth.Succeeded ? "passed" : "failed",
-            auth.Succeeded ? "GitHub CLI's active github.com account is authenticated." : $"GitHub authentication could not be verified. {auth.Detail}",
-            auth.Succeeded ? "" : "Run gh auth login --hostname github.com (or refresh the active account), then rerun doctor.")];
+            auth.Succeeded ? $"GitHub CLI's active {host} account is authenticated." : $"GitHub authentication could not be verified. {auth.Detail}",
+            auth.Succeeded ? "" : $"Run gh auth login --hostname {host} (or refresh the active account), then rerun doctor.")];
     }
 
     private static async Task<JsonObject[]> CheckAzureAsync(JsonObject prefs, DoctorProcessRunner runner, CancellationToken ct)
@@ -290,8 +290,9 @@ internal static partial class Doctor
 
     private static async Task<JsonObject> ReadPreferencesAsync(CancellationToken ct)
     {
-        var directory = Environment.GetEnvironmentVariable("ASPIRE_TEAM_APP_HOME")
-            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Aspire", "TeamApp");
+        var directory = Environment.GetEnvironmentVariable("GITHUB_TEAM_APP_HOME")
+            ?? Environment.GetEnvironmentVariable("ASPIRE_TEAM_APP_HOME")
+            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "GitHub", "TeamApp");
         return await new PreferenceStore(directory).ReadAsync(ct).ConfigureAwait(false);
     }
 

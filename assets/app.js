@@ -1,6 +1,6 @@
 
 const app = document.getElementById("app");
-const standalone = typeof window !== "undefined" && window.aspireTeamStandalone === true;
+const standalone = typeof window !== "undefined" && window.githubTeamStandalone === true;
 const dashboardClient = standalone ? crypto.randomUUID() : null;
 function apiFetch(path, options = {}) {
   return fetch(path, standalone
@@ -11,7 +11,22 @@ function apiFetch(path, options = {}) {
 const loadbar = document.getElementById("loadbar");
 let state = null;
 let prefs = null;
-let view = "queue";       // queue | settings | accounts | notifications | filters
+let scopeGeneration = 0;
+let selectionPending = false;
+let selectionQueue = Promise.resolve();
+let discoveredAccounts = null;
+let accountsScanned = false;
+let accountScanGeneration = 0;
+let repositoryAccount = "";
+let repositoryQuery = "";
+let repositoryResults = [];
+let repositoryError = "";
+let repositorySearching = false;
+let repositorySaving = false;
+let searchGeneration = 0;
+let searchTimer = null;
+let searchController = null;
+let view = "queue";       // queue | settings | accounts | repositories | notifications | filters
 let keysBound = false;
 let cbMenuBound = false;
 let prevRank = 0;
@@ -51,14 +66,234 @@ function adoptAppliedRev() {
   if (state && typeof state.seq === "number") lastAppliedSeq = state.seq;
 }
 function adoptState(payload) {
+  if (!matchesRepository(payload)) return false;
   state = payload.dashboard;
   prefs = payload.prefs;
+  if (state && Array.isArray(state.accounts)) discoveredAccounts = state.accounts;
   loadError = null;
   adoptAppliedRev();
   const appliedSeq = state && state.seq;
   if (!updateAvailable || typeof appliedSeq !== "number" || appliedSeq >= updateAvailable.seq) {
     updateAvailable = null;
   }
+  return true;
+}
+function matchesRepository(payload) {
+  if (!payload || !payload.dashboard) return false;
+  // Canvas hosts without the repository contract retain their existing behavior.
+  if (!prefs || !Object.hasOwn(prefs, "selectedRepository")) return true;
+  const id = prefs.selectedRepository || "";
+  return payload.dashboard.repositoryId === id
+    && (!payload.prefs || payload.prefs.selectedRepository === id);
+}
+function currentAccounts() {
+  return discoveredAccounts || (state && state.accounts) || [];
+}
+function repositoryPicker() {
+  const repositories = prefs?.repositories || [];
+  return '<label class="project-picker" for="repository-picker">Project<select id="repository-picker" aria-label="Selected repository"' + (repositorySaving ? " disabled" : "") + '>' +
+    '<option value=""' + (prefs?.selectedRepository ? " disabled" : " selected") + '>No repository selected</option>' +
+    repositories.map(repo => '<option value="' + esc(repo.id) + '"' +
+      (repo.id === prefs.selectedRepository ? " selected" : "") + '>' +
+      esc(repo.repository + " (" + repo.host + ")") + "</option>").join("") +
+    '</select></label><button class="btn ghost" id="repositories-btn" type="button">Repositories</button>';
+}
+function emptyDashboard(id) {
+  return {
+    repositoryId: id, mode: state?.mode || "review", authenticated: state?.authenticated || false,
+    accounts: currentAccounts(), activeAccounts: state?.activeAccounts || [],
+    notifications: [], lanes: [], repos: [], counts: {}, errors: [],
+    loading: !!id, refreshing: !!id, cacheStatus: "loading",
+  };
+}
+async function selectRepository(id) {
+  if (!id) {
+    const picker = document.getElementById("repository-picker");
+    if (picker) picker.value = prefs?.selectedRepository || "";
+    if (prefs?.selectedRepository) {
+      loadError = "Choose a repository from the list.";
+      render();
+    }
+    return;
+  }
+  if (repositorySaving) return;
+  const generation = ++scopeGeneration;
+  selectionPending = true;
+  prefs = { ...(prefs || {}), selectedRepository: id };
+  state = emptyDashboard(id);
+  pendingState = null;
+  updateAvailable = null;
+  lastAppliedSeq = -1;
+  loadError = null;
+  cancelRepositorySearch();
+  render();
+  // Serialize writes as well as guarding reads: the persisted selection must finish on B,
+  // even when A was already on the wire when the user selected B.
+  const request = selectionQueue.then(() => generation === scopeGeneration
+    ? postJSON("api/repositories/select", { id }) : null);
+  selectionQueue = request.catch(() => {});
+  try {
+    const data = await request;
+    if (generation !== scopeGeneration) return;
+    if (!matchesRepository(data)) throw new Error("Repository selection returned an unexpected dashboard.");
+    const seq = data.dashboard.seq;
+    if (typeof seq !== "number" || seq > lastAppliedSeq) adoptState(data);
+  } catch (error) {
+    if (generation === scopeGeneration) {
+      state = { ...state, loading: false, refreshing: false };
+      loadError = "Could not select repository: " + (error.message || String(error));
+    }
+  } finally {
+    if (generation === scopeGeneration) {
+      selectionPending = false;
+      render();
+    }
+  }
+}
+function cancelRepositorySearch() {
+  ++searchGeneration;
+  if (searchTimer !== null) clearTimeout(searchTimer);
+  if (searchController) searchController.abort();
+  searchTimer = null;
+  searchController = null;
+  repositorySearching = false;
+  repositoryResults = [];
+}
+function scheduleRepositorySearch(accountId, query) {
+  cancelRepositorySearch();
+  repositoryAccount = accountId;
+  repositoryQuery = query;
+  repositoryError = "";
+  const generation = searchGeneration;
+  if (!accountId || !query.trim()) { renderRepositoryResults(); return; }
+  repositorySearching = true;
+  renderRepositoryResults();
+  searchTimer = setTimeout(() => searchRepositories(accountId, query.trim(), generation), 250);
+}
+async function searchRepositories(accountId, query, generation) {
+  if (generation !== searchGeneration) return;
+  const controller = new AbortController();
+  searchController = controller;
+  try {
+    const data = await readJson(await apiFetch("api/repositories/search?accountId=" +
+      encodeURIComponent(accountId) + "&q=" + encodeURIComponent(query), { signal: controller.signal }));
+    if (generation !== searchGeneration) return;
+    repositoryResults = Array.isArray(data.items) ? data.items : [];
+    repositoryError = data.error || "";
+  } catch (error) {
+    if (generation !== searchGeneration || error.name === "AbortError") return;
+    repositoryError = error.message || String(error);
+  } finally {
+    if (generation === searchGeneration) {
+      repositorySearching = false;
+      renderRepositoryResults();
+    }
+  }
+}
+function repositoryResultsHtml() {
+  return '<div role="alert" class="pipeline-err">' + esc(repositoryError) + '</div>' +
+    (repositorySearching ? '<p role="status">Searching repositories...</p>' :
+      '<ul class="repository-results">' + repositoryResults.map(repo =>
+        '<li class="repository-result"><div><b>' + esc(repo.repository) + '</b>' +
+        (repo.private ? ' <span class="meta">Private</span>' : "") +
+        '<p>' + esc(repo.description || "") + '</p></div><button class="btn ghost" type="button" data-repository-add="' +
+        esc(repo.repository) + '"' + (repositorySaving ? " disabled" : "") + '>Add</button></li>'
+      ).join("") + '</ul>' +
+      (repositoryQuery.trim() && !repositoryResults.length && !repositoryError ? '<p role="status">No matching repositories. You can also add an exact owner/repo below.</p>' : ""));
+}
+function renderRepositoryResults() {
+  const results = document.getElementById("repository-results");
+  if (!results) return;
+  results.innerHTML = repositoryResultsHtml();
+  wireRepositoryResults();
+}
+async function mutateRepository(action, value) {
+  if (repositorySaving || selectionPending) return;
+  const generation = scopeGeneration;
+  const accountId = repositoryAccount;
+  const repository = String(value || "").trim();
+  repositoryError = "";
+  if (action === "add" && (!accountId || !/^[\w.-]+\/[\w.-]+$/.test(repository))) {
+    repositoryError = "Choose an account and enter a repository as owner/repo.";
+    renderRepositoryResults();
+    return;
+  }
+  repositorySaving = true;
+  render();
+  try {
+    const data = await postJSON("api/repositories/" + action,
+      action === "add" ? { accountId, repository } : { id: value });
+    if (generation !== scopeGeneration) return;
+    if (!data?.dashboard || !data.prefs) throw new Error("Invalid repository response.");
+    // Adding the first or removing the selected repository may select a different scope.
+    if (data.prefs.selectedRepository !== prefs?.selectedRepository) {
+      ++scopeGeneration;
+      prefs = data.prefs;
+      pendingState = null;
+      updateAvailable = null;
+      lastAppliedSeq = -1;
+    }
+    if (matchesRepository(data) && (typeof data.dashboard.seq !== "number" || data.dashboard.seq > lastAppliedSeq)) adoptState(data);
+    repositoryQuery = "";
+    cancelRepositorySearch();
+  } catch (error) {
+    if (generation === scopeGeneration) repositoryError = error.message || String(error);
+  } finally {
+    repositorySaving = false;
+    if (view === "repositories") render();
+  }
+}
+function repositoriesView() {
+  const accounts = currentAccounts().filter(a => a.status !== "failed");
+  const repositories = prefs?.repositories || [];
+  return '<div class="page"><div class="page-head"><h2>Repositories</h2>' +
+    '<p>Choose one repository in the header to scope Review, Issues, Ship, and Health.</p></div>' +
+    '<div class="section"><h3>Your repositories</h3><ul class="repository-results">' +
+    (repositories.length ? repositories.map(repo =>
+      '<li class="repository-result"><div><b>' + esc(repo.repository) + '</b><p>' + esc(repo.host) +
+      ' &middot; ' + esc(repo.accountId) + '</p></div><div class="row-actions">' +
+      '<button class="btn ghost" type="button" data-repository-select="' + esc(repo.id) + '"' + (repositorySaving ? " disabled" : "") + '>' +
+      (repo.id === prefs.selectedRepository ? "Selected" : "Select") + '</button>' +
+      '<button class="btn ghost" type="button" data-repository-remove="' + esc(repo.id) + '"' +
+      (repositorySaving || selectionPending ? " disabled" : "") + ' aria-label="Remove ' + esc(repo.repository) +
+      '">Remove</button></div></li>').join("") : '<li class="repo-empty">No repositories yet. Add one below.</li>') +
+    '</ul></div><div class="section"><h3>Add a repository</h3><p class="hint">Search using an existing GitHub credential, or enter an exact owner/repo. Credentials are managed separately in Accounts.</p>' +
+    '<label for="repository-account">GitHub account</label><div class="field"><select id="repository-account">' +
+    '<option value="">Choose an account</option>' + accounts.map(a => '<option value="' + esc(a.id) + '"' +
+      (a.id === repositoryAccount ? " selected" : "") + '>' + esc(a.login + " (" + a.host + ")") + '</option>').join("") +
+    '</select></div><label for="repository-search">Find a repository</label><div class="field"><input id="repository-search" type="search" autocomplete="off" value="' +
+    esc(repositoryQuery) + '" placeholder="Search or enter owner/repo"' + (!repositoryAccount ? " disabled" : "") +
+    ' /></div><div id="repository-results">' + repositoryResultsHtml() + '</div>' +
+    '<div class="row-actions"><button class="btn" type="button" id="repository-add"' +
+    (!repositoryAccount || repositorySaving || selectionPending ? " disabled" : "") + '>Add owner/repo</button>' +
+    '<button class="btn ghost" type="button" id="repository-accounts">Manage accounts</button>' +
+    '<button class="btn ghost" type="button" id="rescan-btn"' + (rescanning ? " disabled" : "") + '>Rescan credentials</button></div></div></div>';
+}
+function wireRepositoryResults() {
+  document.querySelectorAll("[data-repository-add]").forEach(button =>
+    button.addEventListener("click", () => mutateRepository("add", button.dataset.repositoryAdd)));
+}
+function wireRepositories() {
+  const picker = document.getElementById("repository-picker");
+  if (picker) picker.addEventListener("change", () => selectRepository(picker.value));
+  const manage = document.getElementById("repositories-btn");
+  if (manage) manage.addEventListener("click", () => goView("repositories"));
+  const accounts = document.getElementById("repository-accounts");
+  if (accounts) accounts.addEventListener("click", () => goView("accounts"));
+  const account = document.getElementById("repository-account");
+  if (account) account.addEventListener("change", () => {
+    scheduleRepositorySearch(account.value, repositoryQuery);
+    render();
+  });
+  const search = document.getElementById("repository-search");
+  if (search) search.addEventListener("input", () => scheduleRepositorySearch(repositoryAccount, search.value));
+  const add = document.getElementById("repository-add");
+  if (add) add.addEventListener("click", () => mutateRepository("add", repositoryQuery));
+  document.querySelectorAll("[data-repository-select]").forEach(button =>
+    button.addEventListener("click", () => selectRepository(button.dataset.repositorySelect)));
+  document.querySelectorAll("[data-repository-remove]").forEach(button =>
+    button.addEventListener("click", () => mutateRepository("remove", button.dataset.repositoryRemove)));
+  wireRepositoryResults();
 }
 function autoApplyEnabled() {
   return !prefs || prefs.autoApplyUpdates !== false;
@@ -68,11 +303,8 @@ function refreshTooltip() {
   const seconds = Math.max(0, Math.ceil((nextPollAt - Date.now()) / 1000));
   return "Refresh now (data will auto-update in " + seconds + "s)";
 }
-const expanded = new Set(); // account ids whose detail (sources + repos) is expanded
+const expanded = new Set(); // account ids whose credential sources are expanded
 const collapsedLanes = new Set(); // lane ids the user collapsed (survives re-render + SSE)
-const draftReposByAcct = {}; // account id -> working copy of that account's watched repos
-const editingByAcct = {};    // account id -> index of the repo row being inline-edited, or -1
-const repoSaveSeqByAcct = {}; // account id -> latest repository save request number
 let pipelineUrlDraft = "";
 let pipelineBranchDraft = "";
 let pipelineError = "";
@@ -97,7 +329,7 @@ function actionKey(kind, prUrl, prRepo, prNumber) {
   return String(kind) + "@" + (prUrl || (String(prRepo) + "#" + String(prNumber)));
 }
 
-const RANK = { queue: 0, notifications: 1, accounts: 1, settings: 1, filters: 1 };
+const RANK = { queue: 0, notifications: 1, accounts: 1, repositories: 1, settings: 1, filters: 1 };
 
 const ICONS = {
   refresh: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>',
@@ -131,7 +363,7 @@ const ICONS = {
   funnel: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>',
 };
 
-const LOGO = '<svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="M3.5 30C1.57 30 0 28.43 0 26.5C0 25.871 0.166 25.259 0.48 24.729L8.818 10.287L8.852 10.236L12.968 3.099C13.593 2.019 14.754 1.349 16 1.349C17.246 1.349 18.407 2.019 19.031 3.098L31.531 24.749C31.833 25.258 31.999 25.87 31.999 26.499C31.999 28.429 30.429 29.999 28.499 29.999L3.5 30Z" fill="#512BD4"/><path d="M25.33 18H16.99L16 16.28L13.13 11.31C13 11.09 12.82 10.9 12.58 10.77C11.87 10.35 10.95 10.6 10.53 11.32L14.7 4.10001C14.96 3.65001 15.44 3.35001 16 3.35001C16.56 3.35001 17.04 3.65001 17.3 4.10001L21.45 11.29L21.46 11.31L21.48 11.34L25.33 18Z" fill="#7455DD"/><path d="M30 26.5C30 27.33 29.33 28 28.5 28H20.17C21 28 21.67 27.33 21.67 26.5C21.67 26.23 21.59 25.97 21.47 25.75L17.3 18.53L16.99 18H25.33L29.8 25.75C29.93 25.97 30 26.23 30 26.5Z" fill="#9780E5"/><path d="M21.67 26.5C21.67 27.33 21 28 20.17 28H11.83C12.66 28 13.33 27.33 13.33 26.5C13.33 26.23 13.26 25.97 13.13 25.75C13.13 25.74 13.12 25.73 13.11 25.72L11.79 23.57L8.82004 18.72C8.55004 18.28 8.07004 18 7.54004 18H16.99L17.3 18.53L17.427 18.75L21.47 25.75C21.59 25.97 21.67 26.23 21.67 26.5Z" fill="#B9AAEE"/><path d="M13.33 26.5C13.33 27.33 12.66 28 11.83 28H3.5C2.67 28 2 27.33 2 26.5C2 26.23 2.07 25.97 2.2 25.75L6.24 18.75C6.51 18.29 7.01 18 7.54 18C8.07 18 8.55 18.28 8.82 18.72L11.79 23.57L13.11 25.72C13.12 25.73 13.13 25.74 13.13 25.75C13.26 25.97 13.33 26.23 13.33 26.5Z" fill="#DCD5F6"/><path d="M16.99 18H7.53999C7.00999 18 6.50999 18.29 6.23999 18.75L6.66999 18L10.49 11.39L10.53 11.33V11.32C10.95 10.6 11.87 10.35 12.58 10.77C12.82 10.9 13 11.09 13.13 11.31L16 16.28L16.99 18Z" fill="#9780E5"/></svg>';
+const LOGO = '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6.766 11.328c-2.063-.25-3.516-1.734-3.516-3.656 0-.781.281-1.625.75-2.188-.203-.515-.172-1.609.063-2.062.625-.078 1.468.25 1.968.703.594-.187 1.219-.281 1.985-.281.765 0 1.39.094 1.953.265.484-.437 1.344-.765 1.969-.687.218.422.25 1.515.046 2.047.5.593.766 1.39.766 2.203 0 1.922-1.453 3.375-3.547 3.64.531.344.89 1.094.89 1.954v1.625c0 .468.391.734.86.547C13.781 14.359 16 11.53 16 8.03 16 3.61 12.406 0 7.984 0 3.563 0 0 3.61 0 8.031a7.88 7.88 0 0 0 5.172 7.422c.422.156.828-.125.828-.547v-1.25c-.219.094-.5.156-.75.156-1.031 0-1.64-.562-2.078-1.609-.172-.422-.36-.672-.719-.719-.187-.015-.25-.093-.25-.187 0-.188.313-.328.625-.328.453 0 .844.281 1.25.86.313.452.64.655 1.031.655s.641-.14 1-.5c.266-.265.47-.5.657-.656"/></svg>';
 
 const ACCT_STATUS = {
   ok: { tone: "success", label: "Full access" },
@@ -168,7 +400,7 @@ function cssEsc(s) { return (window.CSS && CSS.escape) ? CSS.escape(s) : String(
 // enterprise hosts the browser can't reach). Base64 keeps it safe inside both the
 // double-quoted attribute and the single-quoted onerror JS string.
 const FALLBACK_AVATAR = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0MCIgaGVpZ2h0PSI0MCIgdmlld0JveD0iMCAwIDQwIDQwIj48cmVjdCB3aWR0aD0iNDAiIGhlaWdodD0iNDAiIHJ4PSIyMCIgZmlsbD0iIzMwMzYzZCIvPjxjaXJjbGUgY3g9IjIwIiBjeT0iMTUuNSIgcj0iNi41IiBmaWxsPSIjOGI5NDllIi8+PHBhdGggZD0iTTguNSAzMy41YzAtNi40IDUuMi0xMC41IDExLjUtMTAuNXMxMS41IDQuMSAxMS41IDEwLjV6IiBmaWxsPSIjOGI5NDllIi8+PC9zdmc+";
-if (standalone) document.addEventListener("error", (event) => {
+document.addEventListener("error", (event) => {
   const image = event.target;
   if (image && image.tagName === "IMG" && image.hasAttribute("data-fallback-avatar")) {
     image.removeAttribute("data-fallback-avatar");
@@ -182,7 +414,7 @@ function avatarTag(url, login, cls, size) {
   const px = size || 40;
   const src = url || ("https://github.com/" + encodeURIComponent(login || "github") + ".png?size=" + px);
   return '<img class="' + (cls || "avatar") + '" src="' + esc(src) + '" alt="" referrerpolicy="no-referrer" loading="lazy" ' +
-    (standalone ? 'data-fallback-avatar />' : 'onerror="this.onerror=null;this.src=\'' + FALLBACK_AVATAR + '\'" />');
+    'data-fallback-avatar />';
 }
 function acctAvatar(a, size) {
   const url = a && a.avatarUrl ? a.avatarUrl : null;
@@ -209,10 +441,12 @@ async function load() {
   // that newer valid state. Suppress the failure when a newer revision was applied after this
   // request started (the withRefresh catch gates the same class of race with its refreshGen id).
   const startSeq = lastAppliedSeq;
+  const generation = scopeGeneration;
   let changed = false;
   try {
     const res = await apiFetch("api/state");
     const data = await readJson(res);
+    if (generation !== scopeGeneration || !matchesRepository(data)) return;
     // GET /api/state may be served stale-while-revalidate, so a cached seq N can settle after the
     // background stream already delivered seq N+1. Apply this response only when it is legacy (no seq)
     // or strictly newer than what we've already applied, so a late stale load can't roll
@@ -225,7 +459,7 @@ async function load() {
   } catch (e) {
     // Only publish this failure if no newer revision was applied while the GET was pending. A late
     // failure from a superseded request must not clobber the newer valid state (or its banner).
-    if (lastAppliedSeq === startSeq) {
+    if (generation === scopeGeneration && lastAppliedSeq === startSeq) {
       loadError = String((e && e.message) || e);
       changed = true;
     }
@@ -235,12 +469,13 @@ async function load() {
 
 async function withRefresh(fn) {
   const myGen = ++refreshGen;
+  const generation = scopeGeneration;
   let changed = false;
   refreshInFlight++;
   refreshing = true; setLoading(true); beginProgress();
   try {
     const data = await fn();
-    if (data && data.dashboard) {
+    if (generation === scopeGeneration && matchesRepository(data)) {
       // Overlapping refreshes can resolve out of order: an older forced load may finish client-side
       // after a newer one. Apply this response only when it is legacy (no seq) or strictly newer than
       // what we've already applied, so a late older response can't roll state/lastAppliedSeq backward
@@ -255,7 +490,7 @@ async function withRefresh(fn) {
     // Publish this failure only if no newer refresh has started since. A late rejection from an
     // older overlapping refresh must not clobber the newer operation's state/banner — the success
     // path is seq-gated for the same reason, but rejections carry no seq, so gate on refreshGen.
-    if (myGen === refreshGen) {
+    if (generation === scopeGeneration && myGen === refreshGen) {
       loadError = String((e && e.message) || e);
       changed = true;
     }
@@ -281,7 +516,7 @@ function setLoading(on) {
 function updateRefreshControls() {
   const rb = document.getElementById("refresh-btn");
   if (rb) {
-    rb.classList.toggle("spin", refreshing);
+    rb.classList.toggle("spin", refreshing || !!state?.refreshing);
     const tooltip = refreshTooltip();
     rb.dataset.tooltip = tooltip;
     rb.setAttribute("aria-label", tooltip);
@@ -353,12 +588,15 @@ function endProgress() {
 // edit: while off the queue we stash it (applied on return); duplicate final snapshots are
 // dropped; and scroll position is preserved across the re-render.
 function applyPushedState(payload) {
-  if (!payload || !payload.dashboard) return;
-  if (view !== "queue") { pendingState = payload; return; }
+  if (!matchesRepository(payload)) return;
   const seq = payload.dashboard.seq;
   if (typeof seq === "number" && seq <= lastAppliedSeq) {
     // Stale or duplicate: the request response may have already applied this snapshot, or an older
     // overlapping request settled late. Never overwrite the newer state already on screen.
+    return;
+  }
+  if (view !== "queue") {
+    if (!pendingState || typeof seq !== "number" || seq > (pendingState.dashboard.seq ?? -1)) pendingState = payload;
     return;
   }
   // The order endpoint broadcasts the same card snapshot that the optimistic render already
@@ -392,6 +630,7 @@ async function postJSON(path, body) {
 }
 
 function onUpdateAvailable(payload) {
+  if (prefs && Object.hasOwn(prefs, "selectedRepository") && payload?.repositoryId !== prefs.selectedRepository) return;
   if (!payload || typeof payload.seq !== "number" || payload.seq <= lastAppliedSeq) return;
   if (!updateAvailable || payload.seq > updateAvailable.seq) updateAvailable = payload;
   updateRefreshControls();
@@ -399,6 +638,7 @@ function onUpdateAvailable(payload) {
 
 function onPreferences(nextPrefs) {
   if (!nextPrefs || typeof nextPrefs !== "object") return;
+  if (prefs && Object.hasOwn(prefs, "selectedRepository") && nextPrefs.selectedRepository !== prefs.selectedRepository) return;
   const wasEnabled = autoApplyEnabled();
   prefs = nextPrefs;
   updateRefreshControls();
@@ -408,6 +648,7 @@ function onPreferences(nextPrefs) {
 }
 
 function onSnapshot(payload) {
+  if (prefs && Object.hasOwn(prefs, "selectedRepository") && payload?.repositoryId !== prefs.selectedRepository) return;
   onPollSchedule(payload);
   if (!payload || typeof payload.seq !== "number" || payload.seq <= lastAppliedSeq) return;
   if (payload.prefs && typeof payload.prefs === "object") prefs = payload.prefs;
@@ -429,11 +670,13 @@ function onPollSchedule(payload) {
 
 async function applyAvailableUpdate() {
   if (!updateAvailable || applyingUpdate) return;
+  const generation = scopeGeneration;
   applyingUpdate = true;
   updateRefreshControls();
   try {
     const res = await apiFetch("api/state");
     const data = await readJson(res);
+    if (generation !== scopeGeneration || !matchesRepository(data)) return;
     const seq = data.dashboard && data.dashboard.seq;
     if (view !== "queue") {
       pendingState = data;
@@ -446,6 +689,7 @@ async function applyAvailableUpdate() {
       updateAvailable = null;
     }
   } catch (e) {
+    if (generation !== scopeGeneration) return;
     loadError = String((e && e.message) || e);
     if (view === "queue") render();
   } finally {
@@ -458,14 +702,17 @@ async function toggleAutoApply() {
   if (savingAutoApply) return;
   const previous = autoApplyEnabled();
   const enabled = !previous;
+  const generation = scopeGeneration;
   prefs = { ...(prefs || {}), autoApplyUpdates: enabled };
   savingAutoApply = true;
   updateRefreshControls();
   try {
     const data = await postJSON("api/auto-apply", { enabled });
+    if (generation !== scopeGeneration) return;
     if (data && data.prefs) prefs = data.prefs;
     if (enabled && updateAvailable) await applyAvailableUpdate();
   } catch (e) {
+    if (generation !== scopeGeneration) return;
     prefs = { ...(prefs || {}), autoApplyUpdates: previous };
     loadError = String((e && e.message) || e);
     render();
@@ -502,6 +749,7 @@ function captureSettingsDraft() {
   if (!release || !showDrafts || !reviewRequested || !readyToMerge || !changesRequested || !ciFailing) return null;
   return {
     release: release.value,
+    teamMembers: document.getElementById("team-members-input")?.value || "",
     showDrafts: showDrafts.checked,
     sessionFields: standalone ? ["session-project-name", "session-project-url", "session-project"]
       .map(id => ({ id, value: document.getElementById(id)?.value || "" })) : [],
@@ -523,6 +771,8 @@ function restoreSettingsDraft(draft) {
   const changesRequested = document.getElementById("n-changes");
   const ciFailing = document.getElementById("n-ci");
   if (release) release.value = draft.release;
+  const teamMembers = document.getElementById("team-members-input");
+  if (teamMembers) teamMembers.value = draft.teamMembers;
   if (showDrafts) showDrafts.checked = draft.showDrafts;
   if (reviewRequested) reviewRequested.checked = draft.notifications.reviewRequested;
   if (readyToMerge) readyToMerge.checked = draft.notifications.readyToMerge;
@@ -536,15 +786,23 @@ function restoreSettingsDraft(draft) {
 
 async function mutateAzurePipeline(path, body, clearDraft) {
   if (pipelineSaving) return;
+  const generation = scopeGeneration;
   // Pipeline state requires a full render, which otherwise rebuilds the rest of Settings
   // from persisted preferences and discards edits that have not been saved yet.
   let settingsDraft = captureSettingsDraft();
+  if (selectionPending || (Object.hasOwn(prefs, "selectedRepository") && !prefs.selectedRepository)) {
+    pipelineError = selectionPending ? "Wait for repository selection to finish." : "Select a repository before configuring pipelines.";
+    render();
+    restoreSettingsDraft(settingsDraft);
+    return;
+  }
   pipelineSaving = true;
   pipelineError = "";
   render();
   restoreSettingsDraft(settingsDraft);
   try {
     const data = await postJSON(path, body);
+    if (generation !== scopeGeneration || !matchesRepository(data)) return;
     if (data && data.prefs) prefs = data.prefs;
     if (data && data.dashboard) {
       const seq = data.dashboard.seq;
@@ -559,6 +817,7 @@ async function mutateAzurePipeline(path, body, clearDraft) {
     }
     loadError = null;
   } catch (error) {
+    if (generation !== scopeGeneration) return;
     pipelineError = String((error && error.message) || error || "Pipeline update failed");
   } finally {
     settingsDraft = captureSettingsDraft() || settingsDraft;
@@ -700,6 +959,7 @@ function setHealthDragImage(event, card) {
 
 async function commitHealthOrder(nextItems, previousItems, focusId) {
   if (healthOrderSaving) return;
+  const generation = scopeGeneration;
   const previousLayout = captureHealthLayout();
   healthOrderSaving = true;
   state.health.items = nextItems;
@@ -712,6 +972,7 @@ async function commitHealthOrder(nextItems, previousItems, focusId) {
 
   try {
     const data = await postJSON("api/health/order", { order: nextItems.map((item) => item.id) });
+    if (generation !== scopeGeneration || !matchesRepository(data)) return;
     if (data?.prefs) prefs = data.prefs;
     if (data?.dashboard) {
       const seq = data.dashboard.seq;
@@ -722,6 +983,7 @@ async function commitHealthOrder(nextItems, previousItems, focusId) {
     }
     loadError = null;
   } catch (error) {
+    if (generation !== scopeGeneration) return;
     const failedLayout = captureHealthLayout();
     state.health.items = previousItems;
     healthOrderAnnouncement = "Card order was not saved.";
@@ -1010,39 +1272,9 @@ function openCbMenu(split, caret, menu) {
   if (firstItem && typeof firstItem.focus === "function") firstItem.focus();
 }
 
-// Persist one account's repos without a full refresh/broadcast (the editor owns
-// the DOM and a re-render would interrupt typing). The editor is optimistic, so a
-// failed save reverts to the previous draft and shows the API error beside the row.
-function persistAccountRepos(id, previousRepos) {
-  const repos = (draftReposByAcct[id] || []).slice();
-  const seq = (repoSaveSeqByAcct[id] || 0) + 1;
-  repoSaveSeqByAcct[id] = seq;
-  return postJSON("api/account/repos", { id, repos }).then((data) => {
-    if (repoSaveSeqByAcct[id] !== seq) return data;
-    // Gate the adoption on seq like every other response path (load/withRefresh/SSE/goView): a save
-    // that resolves after a newer refresh or pushed snapshot already applied must not roll state
-    // (and lastAppliedSeq via adoptAppliedRev) backward. The repoSaveSeqByAcct guard above only
-    // orders saves for this account against each other, not against those lastAppliedSeq-keyed paths.
-    if (data && data.dashboard) {
-      const dseq = data.dashboard.seq;
-      if (typeof dseq !== "number" || dseq > lastAppliedSeq) adoptState(data);
-    }
-    repoErr(id, "");
-    return data;
-  }).catch((e) => {
-    if (repoSaveSeqByAcct[id] === seq) {
-      const msg = "Couldn't save repositories: " + String((e && e.message) || e);
-      draftReposByAcct[id] = (Array.isArray(previousRepos) ? previousRepos : accountRepos(id)).slice();
-      editingByAcct[id] = -1;
-      renderRepoList(id);
-      repoErr(id, msg);
-    }
-    return null;
-  });
-}
-
 async function saveSettings() {
   const release = document.getElementById("release-input").value;
+  const teamMembers = document.getElementById("team-members-input")?.value || "";
   const showDrafts = document.getElementById("s-drafts").checked;
   const notifications = {
     reviewRequested: document.getElementById("n-review").checked,
@@ -1051,27 +1283,34 @@ async function saveSettings() {
     ciFailing: document.getElementById("n-ci").checked,
   };
   goView("queue", true);
-  await withRefresh(() => postJSON("api/prefs", { release, showDrafts, notifications }));
+  await withRefresh(() => postJSON("api/prefs", { release, showDrafts, teamMembers, notifications }));
 }
 
 async function rescanAccounts() {
+  const generation = ++accountScanGeneration;
   rescanning = true;
   const btn = document.getElementById("rescan-btn");
   if (btn) btn.classList.add("spin");
   try {
     const res = await apiFetch("api/accounts");
     const data = await readJson(res);
-    // Gate on seq like every other response path: if a newer refresh/SSE snapshot applied while this
-    // rescan was in flight, adopting it would roll state (and lastAppliedSeq) backward. When it is the
-    // newest, adoptState() also advances the revision so a delayed lower-seq response cannot roll
-    // the queue back.
-    const dseq = data.dashboard && data.dashboard.seq;
-    if (typeof dseq !== "number" || dseq > lastAppliedSeq) {
-      adoptState(data);
+    if (generation !== accountScanGeneration) return;
+    if (!Array.isArray(data?.accounts)) throw new Error("Invalid account discovery response.");
+    accountsScanned = true;
+    discoveredAccounts = data.accounts;
+    if (!discoveredAccounts.some(a => a.id === repositoryAccount && a.status !== "failed")) {
+      repositoryAccount = "";
+      cancelRepositorySearch();
     }
   } catch (e) {
+    if (generation !== accountScanGeneration) return;
     loadError = String((e && e.message) || e);
-  } finally { rescanning = false; render(); }
+  } finally {
+    if (generation === accountScanGeneration) {
+      rescanning = false;
+      if (view === "accounts" || view === "repositories") render();
+    }
+  }
 }
 
 function dismissNotif(id, cardEl) {
@@ -1085,7 +1324,7 @@ const restoreNotifs = () => withRefresh(() => postJSON("api/notifications/restor
 /* ---- navigation ---- */
 
 function goView(next, forward) {
-  if (view === "accounts" && next !== "accounts") { for (const k in editingByAcct) editingByAcct[k] = -1; }
+  if (view === "repositories" && next !== "repositories") cancelRepositorySearch();
   prevRank = RANK[view] || 0;
   view = next;
   // Returning to the queue is the moment to fold in any dashboard that streamed in while
@@ -1096,11 +1335,12 @@ function goView(next, forward) {
     // while the user was on the form: fold it in only when it is strictly newer than what we
     // already show, mirroring applyPushedState's gate. (No seq → legacy payload, apply as before.)
     const seq = payload.dashboard && payload.dashboard.seq;
-    if (typeof seq !== "number" || seq > lastAppliedSeq) {
+    if (matchesRepository(payload) && (typeof seq !== "number" || seq > lastAppliedSeq)) {
       adoptState(payload);
     }
   }
   render(forward === undefined ? undefined : forward);
+  if ((next === "accounts" || next === "repositories") && !accountsScanned && !rescanning) rescanAccounts();
 }
 
 /* ---- cards ---- */
@@ -1516,7 +1756,7 @@ function reviewBoardHtml() {
   if (att.forMe && att.forMe.length) {
     html += queuePanel({
       id: "for-you", title: "For you", tone: "accent", icon: ICONS.sparkle,
-      subtitle: "Your highest-leverage actions across every repo, pulled to the top of the queue.",
+      subtitle: "Your highest-leverage actions in the selected repository.",
       items: att.forMe.slice(0, 6), cappedTotal: att.forMe.length,
       cardActions: forYouCardActions,
     });
@@ -1625,7 +1865,7 @@ function topbarHtml() {
     ? tabs()
     : '<button class="backbtn" id="back-btn">' + ICONS.back + "Back</button>";
   const right =
-    (state ? accountChip() : "") +
+    accountChip() +
     '<div class="tb-actions">' +
     '<button class="iconbtn live-tooltip ' + (refreshing ? "spin" : "") + '" id="refresh-btn" aria-label="' + refreshTooltip() +
       '" data-tooltip="' + refreshTooltip() + '">' + ICONS.refresh + "</button>" +
@@ -1642,8 +1882,8 @@ function topbarHtml() {
     '<button class="iconbtn ' + (view === "settings" ? "active" : "") + '" id="gear-btn" title="Settings">' + ICONS.gear + "</button>" +
     "</div>";
   return '<div class="topbar" id="topbar">' +
-    '<button class="brand" id="brand-home" type="button" title="Back to review queue"><span class="mark">' + LOGO + '</span><span class="brand-text">Aspire Team App</span></button>' +
-    left + '<span class="spacer"></span>' + right + "</div>";
+    '<button class="brand" id="brand-home" type="button" title="Back to review queue"><span class="mark">' + LOGO + '</span><span class="brand-text">GitHub Team App</span></button>' +
+    repositoryPicker() + left + '<span class="spacer"></span>' + right + "</div>";
 }
 
 /* ---- views ---- */
@@ -1869,6 +2109,14 @@ function healthView() {
 }
 
 function queueView() {
+  if (prefs && Object.hasOwn(prefs, "selectedRepository") && !prefs.selectedRepository) {
+    return '<div class="state"><div class="ico">' + ICONS.layers + '</div><h2>Choose a repository</h2><p>Add a repository on the Repositories page, then select it in the header.</p></div>';
+  }
+  if (state.cacheStatus === "loading") {
+    return '<div class="state" role="status"><div class="ico">' + ICONS.refresh +
+      '</div><h2>' + (state.loading || state.refreshing ? "Loading repository..." : "Repository data unavailable") +
+      '</h2><p>' + (state.refreshing ? "Fetching the selected repository. Cached results will appear when available." : "Use Refresh to try again.") + '</p></div>';
+  }
   if (state.mode === "health") return healthView();
   const active = state.activeAccounts || [];
   const anyEnt = active.some((a) => a.enterprise);
@@ -1884,13 +2132,13 @@ function queueView() {
     ? reviewBoardHtml()
     : (state.lanes.length
         ? state.lanes.map(laneHtml).join("")
-        : '<div class="state"><div class="ico">' + ICONS.check + "</div><h2>All clear</h2><p>No items in " + esc(state.mode) + " mode for your watched repositories.</p></div>");
+        : '<div class="state"><div class="ico">' + ICONS.check + "</div><h2>All clear</h2><p>No items in " + esc(state.mode) + " mode for the selected repository.</p></div>");
   const draftsHidden = !state.showDrafts && state.counts && state.counts.drafts
     ? ' <span class="meta-draft">\u00b7 ' + state.counts.drafts + " draft" + (state.counts.drafts === 1 ? "" : "s") + " hidden</span>"
     : "";
   return '<div class="subbar">' +
       '<span class="who">' + who + "</span>" +
-      '<span class="meta">' + state.counts.prs + " open PRs across " + state.repos.length + " repos, updated " + timeAgo(state.fetchedAt) + draftsHidden + "</span>" +
+      '<span class="meta">' + state.counts.prs + " open PRs in the selected repository" + draftsHidden + "</span>" +
       statsHtml() +
     "</div>" +
     (state.errors && state.errors.length ? '<div class="errbar">' + esc(state.errors.join(" \u00b7 ")) + "</div>" : "") +
@@ -1941,27 +2189,27 @@ function filtersView() {
       '<div class="policy">' +
         '<div class="policy-row">' + ICONS.merge + "<span>A PR reaches the <b>shared review queue</b> only once <b>checks are green</b> and <b>all feedback is resolved</b>. Unfinished work stays in the author\u2019s <b>Your PRs</b> lane.</span></div>" +
         '<div class="policy-row">' + ICONS.pr + "<span><b>Drafts, merge conflicts, and needs-author-action</b> PRs are routed out of the shared lists, so reviewers only see PRs that are genuinely ready.</span></div>" +
-        '<div class="policy-row">' + ICONS.xcircle + "<span><b>CI-failing</b> PRs are held out of Needs attention. A failure driven only by informational <b>aspire-1p checks</b> (proof of presence) is not counted as red.</span></div>" +
+        '<div class="policy-row">' + ICONS.xcircle + "<span><b>CI-failing</b> PRs are held out of Needs attention so authors can resolve failures first.</span></div>" +
         '<div class="policy-row">' + ICONS.usersSm + "<span>PRs you authored <b>as yourself or via Copilot</b> both count as yours, so delegated work still lands in your lanes and developer totals.</span></div>" +
       "</div>" +
     "</div>" +
 
     '<div class="section' + cur("issues") + '"><h3>' + ICONS.tag + " Issues</h3>" +
       '<div class="policy">' +
-        '<div class="policy-row">' + ICONS.alertSm + "<span><b>Focus buckets</b> surface the issues that matter first: regressions, CTI team items ([aspiree2e]), afscrome finds, and your own issues.</span></div>" +
+        '<div class="policy-row">' + ICONS.alertSm + "<span><b>Focus buckets</b> surface regressions, configured team members' work, and your own issues.</span></div>" +
         '<div class="policy-row">' + ICONS.dot2 + "<span>Everything else lands in <b>Needs triage</b> (unlabeled and unassigned) or <b>Recently active</b>, so no open issue silently drops off.</span></div>" +
       "</div>" +
     "</div>" +
 
     '<div class="section' + cur("ship") + '"><h3>' + ICONS.merge + " Ship</h3>" +
       '<div class="policy">' +
-        '<div class="policy-row">' + ICONS.clock + "<span>Groups open work for the active milestone (<b>" + esc(prefs.release || state.release || "\u2014") + "</b>) so the release view stays focused on what is landing now.</span></div>" +
+        '<div class="policy-row">' + ICONS.clock + "<span>" + (prefs.release ? "Groups open work for milestone <b>" + esc(prefs.release) + "</b>." : "No release filter is configured. Shows open work across milestones.") + "</span></div>" +
       "</div>" +
     "</div>" +
 
     '<div class="section' + cur("health") + '"><h3>' + ICONS.pulse + " Health</h3>" +
       '<div class="policy">' +
-        '<div class="policy-row">' + ICONS.pulse + "<span>Checks the <b>default branch</b> of each watched GitHub repository and every Azure DevOps pipeline explicitly configured in Settings.</span></div>" +
+        '<div class="policy-row">' + ICONS.pulse + "<span>Checks the <b>default branch</b> of the selected repository and its associated delivery sources.</span></div>" +
         '<div class="policy-row">' + ICONS.alertSm + "<span>Likely causes appear only when provider evidence supports them. Repository inactivity by itself does <b>not</b> make a source unhealthy.</span></div>" +
       "</div>" +
     "</div>" +
@@ -1974,7 +2222,10 @@ function filtersView() {
 }
 
 function pipelineEditorHtml() {
-  const pipelines = Array.isArray(prefs.azurePipelines) ? prefs.azurePipelines : [];
+  const repositoryScoped = Object.hasOwn(prefs, "selectedRepository");
+  const unavailable = selectionPending || (repositoryScoped && !prefs.selectedRepository);
+  const pipelines = (Array.isArray(prefs.azurePipelines) ? prefs.azurePipelines : [])
+    .filter(pipeline => !repositoryScoped || (prefs.selectedRepository && pipeline.repositoryId === prefs.selectedRepository));
   const rows = pipelines.length
     ? pipelines.map((pipeline) => {
         const name = pipeline.name || (pipeline.definitionId ? "Pipeline " + pipeline.definitionId : "Azure DevOps pipeline");
@@ -1982,26 +2233,28 @@ function pipelineEditorHtml() {
         return '<li class="pipeline-row"><div class="pipeline-main"><span class="pipeline-name">' + esc(name) +
           '</span><span class="pipeline-meta">' + esc(branch + " \u00b7 " + pipeline.url) +
           '</span></div><button class="repo-ico danger pipeline-remove" type="button" data-pipeline-id="' +
-          esc(pipeline.id) + '" title="Remove pipeline" aria-label="Remove ' + esc(name) + '">' + ICONS.trash + "</button></li>";
+          esc(pipeline.id) + '" title="Remove pipeline" aria-label="Remove ' + esc(name) + '"' +
+          (pipelineSaving || unavailable ? " disabled" : "") + '>' + ICONS.trash + "</button></li>";
       }).join("")
-    : '<li class="repo-empty">No additional Azure DevOps pipelines configured.</li>';
+    : '<li class="repo-empty">No pipelines configured for this repository.</li>';
   return '<div class="section" id="pipeline-settings"><h3>' + ICONS.pulse + " Azure DevOps pipelines</h3>" +
-    '<p class="hint">A matching Azure Repo delivery pipeline is auto-discovered from your <b>az</b> CLI default project. Paste a pipeline or build URL to monitor additional definitions. Existing <b>az</b> or <b>AZURE_DEVOPS_EXT_PAT</b> authentication is reused; credentials are never stored.</p>' +
+    '<p class="hint">Pipelines are assigned to the selected repository. Add a pipeline or build URL to monitor it. Existing <b>az</b> or <b>AZURE_DEVOPS_EXT_PAT</b> authentication is reused; credentials are never stored.</p>' +
+    (repositoryScoped && !prefs.selectedRepository ? '<p class="hint">Select a repository before configuring pipelines.</p>' : "") +
     '<div class="pipeline-add"><input id="pipeline-url-input" type="text" value="' + esc(pipelineUrlDraft) +
     '" placeholder="https://dev.azure.com/org/project/_build?definitionId=123" aria-label="Azure DevOps pipeline URL" />' +
     '<input id="pipeline-branch-input" class="pipeline-branch" type="text" value="' + esc(pipelineBranchDraft) +
     '" placeholder="Branch (default: main)" aria-label="Pipeline branch override" />' +
     '<button class="repo-add-btn" id="pipeline-add-btn" type="button" title="Add pipeline" aria-label="Add pipeline"' +
-    (pipelineSaving ? ' disabled aria-busy="true"' : "") + ">" + (pipelineSaving ? ICONS.refresh : ICONS.plus) +
+    (pipelineSaving ? ' disabled aria-busy="true"' : unavailable ? " disabled" : "") + ">" + (pipelineSaving ? ICONS.refresh : ICONS.plus) +
     '</button></div><div class="pipeline-err" role="alert">' + esc(pipelineError) +
     '</div><ul class="pipeline-list">' + rows + "</ul></div>";
 }
 
 function settingsView() {
-  const n = prefs.notifications;
+  const n = prefs.notifications || {};
   const limit = (state.reviewLimit || 10);
   return '<div class="page">' +
-    '<div class="page-head"><h2>Settings</h2><p>Tune the shared review queue, delivery health, the ship milestone, and when the canvas speaks up. Watched repositories are configured per account in the Accounts tab.</p></div>' +
+    '<div class="page-head"><h2>Settings</h2><p>Tune the review queue, team, delivery health, and notifications. Manage projects on the Repositories page and credentials on the Accounts page.</p></div>' +
     '<div class="section"><h3>Review queue</h3>' +
       '<p class="hint">The shared queue is team-managed, not individually sorted. It shows at most <b>' + limit + '</b> PRs, ranked so the oldest waits surface first.</p>' +
       '<div class="policy">' +
@@ -2011,8 +2264,11 @@ function settingsView() {
       toggle("s-drafts", "Show draft PRs", "Include drafts in lanes and counts", !!prefs.showDrafts) +
     "</div>" +
     '<div class="section"><h3>Ship milestone</h3>' +
-      '<p class="hint">Used by Ship mode to group work for the active release.</p>' +
-      '<div class="field"><input type="text" id="release-input" value="' + esc(prefs.release || "") + '" placeholder="13.5" /></div></div>' +
+      '<p class="hint">Used by Ship mode to group work for a release. Leave empty for no release filter.</p>' +
+      '<div class="field"><label for="release-input">Release milestone</label><input type="text" id="release-input" value="' + esc(prefs.release || "") + '" placeholder="No release filter" /></div></div>' +
+    '<div class="section"><h3>Team members</h3><p class="hint">GitHub logins separated by commas or new lines. Leave empty for no configured team.</p>' +
+      '<div class="field"><label for="team-members-input">GitHub logins</label><textarea id="team-members-input" rows="4">' +
+      esc(Array.isArray(prefs.teamMembers) ? prefs.teamMembers.join("\n") : prefs.teamMembers || "") + '</textarea></div></div>' +
     pipelineEditorHtml() +
     (standalone ? standaloneSettingsView() : "") +
     '<div class="section" id="notif-settings"><h3>Notifications</h3>' +
@@ -2031,7 +2287,7 @@ function settingsView() {
 function standaloneSettingsView() {
   const config = prefs.sessionLauncher || { projects: [], selectedRepositoryUrl: "" };
   const projects = config.projects || [];
-  const suggestions = [...new Set(["microsoft/aspire", "devdiv-microsoft/aspire-1p", ...(state.repos || [])])];
+  const suggestions = [...new Set((prefs.repositories || []).map(repo => "https://" + repo.host + "/" + repo.repository))];
   return '<div class="section"><h3>GitHub App projects</h3>' +
     '<p class="hint">PR actions automatically use the project with the same GitHub repository. ' +
     'Choose a fallback project for health sources without a mapped repository. GitHub App confirms each new session. ' +
@@ -2041,9 +2297,9 @@ function standaloneSettingsView() {
     projects.map(p => '<option value="' + esc(p.repositoryUrl) + '"' +
       (p.repositoryUrl === config.selectedRepositoryUrl ? " selected" : "") + '>' + esc(p.name) + " - " + esc(p.repositoryUrl) + "</option>").join("") +
     '</select></div><div class="field"><label for="session-project-name">Project name</label>' +
-    '<input id="session-project-name" placeholder="Aspire" /></div>' +
+    '<input id="session-project-name" placeholder="Project name" /></div>' +
     '<div class="field"><label for="session-project-url">GitHub repository URL or owner/repo</label>' +
-    '<input id="session-project-url" list="session-project-suggestions" placeholder="https://github.com/microsoft/aspire" />' +
+    '<input id="session-project-url" list="session-project-suggestions" placeholder="https://github.com/owner/repo" />' +
     '<datalist id="session-project-suggestions">' +
     suggestions.map(repo => '<option value="' + esc(repo) + '"></option>').join("") +
     '</datalist></div><div class="row-actions"><button type="button" class="btn ghost" id="add-session-project">Add project</button>' +
@@ -2053,12 +2309,13 @@ function standaloneSettingsView() {
     '<div class="section"><h3>Prerequisites</h3><p class="hint">Check tools and authentication without installing anything or starting sessions.</p>' +
     '<button type="button" class="btn ghost" id="doctor-btn"' + (doctorRunning ? " disabled" : "") + '>' +
     (doctorRunning ? "Checking..." : "Run doctor") + '</button>' +
-    (doctorResult ? '<pre role="status" style="white-space:pre-wrap;overflow-wrap:anywhere">' + esc(doctorResult) + "</pre>" : "") +
+    (doctorResult ? '<pre role="status" class="doctor-report">' + esc(doctorResult) + "</pre>" : "") +
     "</div>";
 }
 
 async function saveSessionProject(action) {
   if (sessionSettingsSaving) return;
+  const generation = scopeGeneration;
   sessionSettingsSaving = true;
   const settingsDraft = captureSettingsDraft();
   let saved = false;
@@ -2082,7 +2339,7 @@ async function saveSessionProject(action) {
     }
     await postJSON("api/session/configuration", { projects, selectedRepositoryUrl: selected });
     const data = await readJson(await apiFetch("api/state"));
-    prefs = data.prefs;
+    if (generation === scopeGeneration && matchesRepository(data)) prefs = data.prefs;
     sessionSettingsError = "";
     saved = true;
   } catch (error) {
@@ -2119,7 +2376,7 @@ async function runDoctor() {
 function srcRow(s) {
   const t = (ACCT_STATUS[s.status] || ACCT_STATUS.failed);
   const meta = [];
-  if (s.status !== "failed") meta.push("<span>" + s.accessible + "/" + s.total + " repos</span>");
+  if (s.status !== "failed" && typeof s.total === "number") meta.push("<span>" + s.accessible + "/" + s.total + " repos</span>");
   if (s.scopes && s.scopes.includes("read:org")) meta.push('<span class="scopes">read:org</span>');
   if (s.reason) meta.push("<span>" + esc(s.reason) + "</span>");
   return '<div class="src-row">' +
@@ -2131,28 +2388,10 @@ function srcRow(s) {
   "</div>";
 }
 
-function repoEditorHtml(a) {
-  const id = a.id;
-  const count = (draftReposByAcct[id] || a.repos || []).length;
-  return '<div class="acct-repos">' +
-    '<div class="acct-repos-head"><span>Watched repositories</span><span class="rcount" data-rcount="' + esc(id) + '">' + count + "</span></div>" +
-    '<p class="acct-repos-hint">Add a repo as <code>owner/repo</code>, then press Enter or the plus. Changes save to this account immediately.</p>' +
-    '<div class="repo-add">' +
-      '<input class="repo-add-input" data-addinput="' + esc(id) + '" type="text" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="owner/repo" />' +
-      '<button class="repo-add-btn" data-add="' + esc(id) + '" title="Add repository" aria-label="Add repository">' + ICONS.plus + "</button>" +
-    "</div>" +
-    '<div class="repo-err" data-err="' + esc(id) + '"></div>' +
-    '<ul class="repo-list" data-list="' + esc(id) + '">' + repoRowsHtml(id) + "</ul>" +
-  "</div>";
-}
-
 function accountCard(a, asPicker) {
   const tone = acctTone(a);
   const st = (ACCT_STATUS[a.status] || ACCT_STATUS.failed);
   const usable = a.status !== "failed";
-  // Seed this account's repo draft from the server copy unless mid-edit.
-  if (editingByAcct[a.id] == null || editingByAcct[a.id] < 0) draftReposByAcct[a.id] = (a.repos || []).slice();
-  if (editingByAcct[a.id] == null) editingByAcct[a.id] = -1;
   const open = expanded.has(a.id) || asPicker;
   const kinds = a.sourceKinds || [...new Set((a.sources || []).map((s) => s.source))];
   const badgeHtml = kinds.map((k) => '<span class="src-badge">' + esc(srcLabel(k)) + "</span>").join("");
@@ -2161,7 +2400,7 @@ function accountCard(a, asPicker) {
     ? '<span class="ent-badge" title="' + esc(a.host || "GitHub Enterprise") + '">' + ICONS.building + "Enterprise</span>"
     : "";
   const meta = [];
-  if (usable) meta.push("<span>" + a.accessible + "/" + a.total + " repos</span>");
+  if (usable && typeof a.total === "number") meta.push("<span>" + a.accessible + "/" + a.total + " repos</span>");
   if (a.hasReadOrg) meta.push('<span class="scopes">read:org</span>');
   if (a.reason) meta.push("<span>" + esc(a.reason) + "</span>");
   const detail = (a.sources || []).map(srcRow).join("");
@@ -2183,21 +2422,20 @@ function accountCard(a, asPicker) {
       "</div>" +
     "</div>" +
     '<div class="acct-detail"><div class="inner">' +
-      repoEditorHtml(a) +
       (detail ? '<div class="src-list">' + detail + "</div>" : "") +
     "</div></div>" +
   "</div>";
 }
 
 function accountsView() {
-  const accts = (state && state.accounts) || [];
+  const accts = currentAccounts();
   const activeCount = accts.filter((a) => a.active).length;
   const rows = accts.length
     ? '<div class="acct-list">' + accts.map((a) => accountCard(a, false)).join("") + "</div>"
     : '<p class="acct-intro">No GitHub credentials detected. Run <code>gh auth login</code> and rescan.</p>';
   return '<div class="page">' +
-    '<div class="page-head" style="display:flex;align-items:flex-end;gap:10px">' +
-      '<div><h2>GitHub accounts</h2><p>Enable any number of accounts. Their results interleave across all tabs, and each account watches its own repositories.</p></div>' +
+    '<div class="page-head page-head-actions">' +
+      '<div><h2>GitHub accounts</h2><p>Discover and enable existing credentials. Repository membership and selection are managed separately on the Repositories page.</p></div>' +
       '<div class="page-actions"><button class="rescan-btn ' + (rescanning ? "spin" : "") + '" id="rescan-btn">' + ICONS.refresh + "Rescan</button></div>" +
     "</div>" +
     (accts.length ? '<p class="acct-intro">' + activeCount + " of " + accts.length + " account" + (accts.length === 1 ? "" : "s") + " active.</p>" : "") +
@@ -2227,7 +2465,7 @@ function notificationsView() {
     ).join("") + "</div>";
   }
   return '<div class="page">' +
-    '<div class="page-head" style="display:flex;align-items:flex-end;gap:10px">' +
+    '<div class="page-head page-head-actions">' +
       '<div><h2>Notifications</h2><p>' + (items.length ? items.length + " active" : "Up to date") +
         (dismissed ? ", " + dismissed + " dismissed" : "") + ".</p></div>" +
       '<div class="page-actions">' +
@@ -2240,13 +2478,13 @@ function notificationsView() {
 }
 
 function authPicker() {
-  const accts = state.accounts || [];
+  const accts = currentAccounts();
   const picker = accts.length
-    ? '<div class="acct-list" style="text-align:left;margin-top:18px">' + accts.map((a) => accountCard(a, true)).join("") + "</div>"
+    ? '<div class="acct-list auth-accounts">' + accts.map((a) => accountCard(a, true)).join("") + "</div>"
     : '<span class="cmd">gh auth login</span>';
-  return '<div class="page" style="max-width:560px">' +
-    '<div class="state" style="padding-top:32px"><div class="ico">' + ICONS.users + "</div>" +
-    "<h2>Enable a GitHub account</h2><p>" + esc(state.message) + "</p></div>" +
+  return '<div class="page auth-page">' +
+    '<div class="state auth-state"><div class="ico">' + ICONS.users + "</div>" +
+    "<h2>Enable a GitHub account</h2><p>" + esc(state.message || "Connect existing credentials to add a repository.") + "</p></div>" +
     picker +
   "</div>";
 }
@@ -2258,17 +2496,24 @@ function render(forward) {
   // Drop any split-button menu we portaled to <body> before rebuilding the subtree, so an
   // open menu never survives a re-render as a detached orphan carrying stale click handlers.
   document.querySelectorAll("body > .cb-menu").forEach((m) => m.remove());
-  if (loadError && !state) {
+  if (loadError && !state && view === "queue") {
     app.innerHTML = topbarShell() +
       '<div class="state"><div class="ico">' + ICONS.alert + '</div><h2>Could not load</h2><p>' + esc(loadError) +
       '</p><div class="state-cta"><button class="btn" id="retry-btn">Try again</button></div></div>';
     const rt = document.getElementById("retry-btn"); if (rt) rt.addEventListener("click", load);
+    wire();
     return;
   }
-  if (!state) return; // skeleton (initial HTML) stays until first load resolves
+  if (!state && view !== "repositories" && view !== "accounts") {
+    app.innerHTML = topbarHtml() + '<div class="state" role="status">Loading...</div>';
+    wire();
+    return;
+  }
 
   let inner;
-  if (!state.authenticated && view === "queue" && state.mode !== "health") inner = authPicker();
+  if (view === "repositories") inner = repositoriesView();
+  else if (view === "accounts") inner = accountsView();
+  else if (!state.authenticated && view === "queue" && state.mode !== "health" && !prefs?.selectedRepository) inner = authPicker();
   else if (view === "settings") inner = settingsView();
   else if (view === "filters") inner = filtersView();
   else if (view === "accounts") inner = accountsView();
@@ -2285,7 +2530,17 @@ function render(forward) {
       '<button class="errbar-x" id="load-errbar-dismiss" type="button" title="Dismiss" aria-label="Dismiss">' + ICONS.x + "</button></div>"
     : "";
   const motionClass = healthOrderSaving ? " no-motion" : "";
-  app.innerHTML = topbarHtml() + banner + '<div class="viewport"><div class="view ' + dir + motionClass + '">' + inner + "</div></div>";
+  const noRepository = prefs && Object.hasOwn(prefs, "selectedRepository") && !prefs.selectedRepository;
+  const freshnessLabel = noRepository ? "No repository selected" :
+    state?.cacheStatus === "cached" ? "Cached data" :
+    state?.cacheStatus === "live" ? "Live data" :
+    state?.loading || state?.refreshing ? "Loading data" : "No data available";
+  const freshness = state && (noRepository || state.cacheStatus || state.refreshError)
+    ? '<div class="freshness" role="status">' + esc(freshnessLabel) +
+      (!noRepository && state.fetchedAt && ["cached", "live"].includes(state.cacheStatus) ? " &middot; Updated " + esc(timeAgo(state.fetchedAt)) : "") +
+      (!noRepository && state.refreshing ? " &middot; Refreshing..." : "") + '</div>' +
+      (state.refreshError ? '<div class="errbar" role="alert">Refresh failed: ' + esc(state.refreshError) + '</div>' : "") : "";
+  app.innerHTML = topbarHtml() + banner + freshness + '<div class="viewport"><div class="view ' + dir + motionClass + '">' + inner + "</div></div>";
   if (banner) {
     const bx = document.getElementById("load-errbar-dismiss");
     if (bx) bx.addEventListener("click", function () { loadError = null; render(); });
@@ -2357,174 +2612,7 @@ function layoutGrid(grid) {
 }
 
 function topbarShell() {
-  return '<div class="topbar"><span class="brand"><span class="mark">' + LOGO + '</span><span class="brand-text">Aspire Team App</span></span><span class="spacer"></span></div>';
-}
-
-/* ---- watched-repository editor ---- */
-
-var REPO_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/;
-
-function normRepo(v) {
-  return String(v || "").trim()
-    .replace(/^https?:\/\/github\.com\//i, "")
-    .replace(/\.git$/i, "")
-    .replace(/\/+$/, "");
-}
-
-function repoErr(id, msg) {
-  var el = document.querySelector('.repo-err[data-err="' + cssEsc(id) + '"]');
-  if (!el) return;
-  if (!msg) { el.textContent = ""; el.classList.remove("show"); return; }
-  el.textContent = msg; el.classList.add("show");
-}
-
-function shake(el) {
-  if (!el) return;
-  el.classList.remove("shake");
-  void el.offsetWidth;
-  el.classList.add("shake");
-}
-
-function repoRowsHtml(id) {
-  var repos = draftReposByAcct[id] || [];
-  var editing = editingByAcct[id];
-  if (!repos.length) {
-    return '<li class="repo-empty">No repositories yet. Add one above to start watching it.</li>';
-  }
-  return repos.map(function (r, i) {
-    if (i === editing) {
-      return '<li class="repo-row editing" data-acct="' + esc(id) + '" data-i="' + i + '">' +
-        '<input class="repo-edit-input" data-editinput="' + esc(id) + '" type="text" spellcheck="false" autocomplete="off" value="' + esc(r) + '" />' +
-        '<span class="repo-acts">' +
-          '<button class="repo-ico ok" data-save-edit="' + i + '" data-acct="' + esc(id) + '" title="Save" aria-label="Save">' + ICONS.check + "</button>" +
-          '<button class="repo-ico" data-cancel-edit="' + i + '" data-acct="' + esc(id) + '" title="Cancel" aria-label="Cancel">' + ICONS.x + "</button>" +
-        "</span></li>";
-    }
-    return '<li class="repo-row" data-acct="' + esc(id) + '" data-i="' + i + '">' +
-      '<span class="repo-name">' + esc(r) + "</span>" +
-      '<span class="repo-acts">' +
-        '<button class="repo-ico" data-edit="' + i + '" data-acct="' + esc(id) + '" title="Edit" aria-label="Edit">' + ICONS.pencil + "</button>" +
-        '<button class="repo-ico danger" data-del="' + i + '" data-acct="' + esc(id) + '" title="Remove" aria-label="Remove">' + ICONS.trash + "</button>" +
-      "</span></li>";
-  }).join("");
-}
-
-function updateRepoCount(id) {
-  var c = document.querySelector('.rcount[data-rcount="' + cssEsc(id) + '"]');
-  if (c) c.textContent = (draftReposByAcct[id] || []).length;
-}
-
-function accountRepos(id) {
-  const accts = (state && state.accounts) || [];
-  const a = accts.find(function (acct) { return acct.id === id; });
-  return (a && a.repos) || [];
-}
-
-function renderRepoList(id, flagLast) {
-  var ul = document.querySelector('.repo-list[data-list="' + cssEsc(id) + '"]');
-  if (!ul) return;
-  ul.innerHTML = repoRowsHtml(id);
-  updateRepoCount(id);
-  if (flagLast) {
-    var rows = ul.querySelectorAll(".repo-row");
-    var last = rows[rows.length - 1];
-    if (last) { last.classList.add("added"); last.addEventListener("animationend", function () { last.classList.remove("added"); }, { once: true }); }
-  }
-  wireRepoRows(id);
-}
-
-function addRepoFromInput(id) {
-  var inp = document.querySelector('.repo-add-input[data-addinput="' + cssEsc(id) + '"]');
-  if (!inp) return;
-  var v = normRepo(inp.value);
-  if (!v) { return; }
-  if (!REPO_RE.test(v)) { repoErr(id, "Use the owner/repo format, like microsoft/aspire."); shake(inp); return; }
-  var list = draftReposByAcct[id] || (draftReposByAcct[id] = []);
-  if (list.some(function (r) { return r.toLowerCase() === v.toLowerCase(); })) {
-    repoErr(id, v + " is already in the list."); shake(inp); return;
-  }
-  var before = list.slice();
-  list.push(v);
-  inp.value = "";
-  repoErr(id, "");
-  renderRepoList(id, true);
-  persistAccountRepos(id, before);
-  inp.focus();
-}
-
-function commitEdit(id, i) {
-  var inp = document.querySelector('.repo-edit-input[data-editinput="' + cssEsc(id) + '"]');
-  if (!inp) return;
-  var v = normRepo(inp.value);
-  var list = draftReposByAcct[id] || [];
-  if (!REPO_RE.test(v)) { repoErr(id, "Use the owner/repo format, like microsoft/aspire."); shake(inp); return; }
-  if (list.some(function (r, j) { return j !== i && r.toLowerCase() === v.toLowerCase(); })) {
-    repoErr(id, v + " is already in the list."); shake(inp); return;
-  }
-  var before = list.slice();
-  list[i] = v; editingByAcct[id] = -1; repoErr(id, "");
-  renderRepoList(id);
-  persistAccountRepos(id, before);
-}
-
-function deleteRepo(id, i, row) {
-  var before = (draftReposByAcct[id] || []).slice();
-  // The row-removal animation is our cue to actually splice, but a missed
-  // animationend (reduced motion, a backgrounded tab, an interrupted animation)
-  // would strand the row. We keep a fallback timer as a backstop, so both the
-  // animationend handler and the timer can fire. A once-only guard makes the splice
-  // run exactly once: without it the second call would splice a now-shifted index
-  // and silently drop the wrong repository.
-  var ran = false;
-  var fallback = null;
-  var done = function () {
-    if (ran) return;
-    ran = true;
-    if (fallback) clearTimeout(fallback);
-    (draftReposByAcct[id] || []).splice(i, 1);
-    if (editingByAcct[id] === i) editingByAcct[id] = -1;
-    renderRepoList(id);
-    persistAccountRepos(id, before);
-  };
-  if (row) { row.classList.add("removing"); row.addEventListener("animationend", done, { once: true }); fallback = setTimeout(done, 240); }
-  else done();
-}
-
-function wireRepoRows(id) {
-  var ul = document.querySelector('.repo-list[data-list="' + cssEsc(id) + '"]');
-  if (!ul) return;
-  ul.querySelectorAll("[data-edit]").forEach(function (b) {
-    b.addEventListener("click", function () {
-      editingByAcct[id] = parseInt(b.dataset.edit, 10); repoErr(id, ""); renderRepoList(id);
-      var ei = document.querySelector('.repo-edit-input[data-editinput="' + cssEsc(id) + '"]'); if (ei) { ei.focus(); ei.select(); }
-    });
-  });
-  ul.querySelectorAll("[data-del]").forEach(function (b) {
-    var fired = false;
-    b.addEventListener("click", function () { if (fired) return; fired = true; deleteRepo(id, parseInt(b.dataset.del, 10), b.closest(".repo-row")); });
-  });
-  ul.querySelectorAll("[data-save-edit]").forEach(function (b) {
-    b.addEventListener("click", function () { commitEdit(id, parseInt(b.dataset.saveEdit, 10)); });
-  });
-  ul.querySelectorAll("[data-cancel-edit]").forEach(function (b) {
-    b.addEventListener("click", function () { editingByAcct[id] = -1; repoErr(id, ""); renderRepoList(id); });
-  });
-  var ei = ul.querySelector(".repo-edit-input");
-  if (ei) ei.addEventListener("keydown", function (e) {
-    if (e.key === "Enter") { e.preventDefault(); commitEdit(id, editingByAcct[id]); }
-    else if (e.key === "Escape") { e.preventDefault(); editingByAcct[id] = -1; repoErr(id, ""); renderRepoList(id); }
-  });
-}
-
-function wireRepoEditor(id) {
-  var addBtn = document.querySelector('.repo-add-btn[data-add="' + cssEsc(id) + '"]');
-  if (addBtn) addBtn.addEventListener("click", function () { addRepoFromInput(id); });
-  var inp = document.querySelector('.repo-add-input[data-addinput="' + cssEsc(id) + '"]');
-  if (inp) inp.addEventListener("keydown", function (e) {
-    if (e.key === "Enter") { e.preventDefault(); addRepoFromInput(id); }
-    else { repoErr(id, ""); }
-  });
-  wireRepoRows(id);
+  return topbarHtml();
 }
 
 function isSettingsSaveShortcut(event) {
@@ -2537,6 +2625,7 @@ function isSettingsSaveShortcut(event) {
 }
 
 function wire() {
+  wireRepositories();
   const addSessionProject = document.getElementById("add-session-project");
   if (addSessionProject) addSessionProject.addEventListener("click", () => saveSessionProject("add"));
   const saveSessionSelection = document.getElementById("save-session-project");
@@ -2704,11 +2793,11 @@ function wire() {
 }
 
 function wireAccounts() {
-  // Active toggles interleave/withdraw an account's results across every tab.
+  // Account availability is independent of repository membership.
   document.querySelectorAll("input[data-active]").forEach((inp) =>
     inp.addEventListener("change", () => { if (!inp.disabled) toggleAccountActive(inp.dataset.active, inp.checked); }));
 
-  // Expand/collapse the account detail (repo editor + credential sources).
+  // Expand/collapse credential sources.
   document.querySelectorAll("[data-expand]").forEach((b) =>
     b.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -2719,11 +2808,6 @@ function wireAccounts() {
       else { expanded.add(id); card.classList.add("open"); }
     }));
 
-  // Per-account watched-repository editors.
-  document.querySelectorAll(".acct-card").forEach((card) => {
-    const id = card.dataset.card;
-    if (id) wireRepoEditor(id);
-  });
 }
 
 // Live updates over Server-Sent Events. Progress drives the deterministic top bar. State events
@@ -2732,7 +2816,9 @@ function wireAccounts() {
 try {
   const es = new EventSource(standalone ? "events?client=" + dashboardClient : "events");
   if (standalone) es.addEventListener("refresh-error", (e) => {
-    loadError = JSON.parse(e.data).error;
+    const data = JSON.parse(e.data);
+    if (prefs && Object.hasOwn(prefs, "selectedRepository") && data.repositoryId !== prefs.selectedRepository) return;
+    loadError = data.error;
     if (view === "queue") render();
   });
   es.addEventListener("progress", (e) => {
@@ -2755,4 +2841,5 @@ try {
   });
 } catch {}
 
+wireRepositories();
 load();

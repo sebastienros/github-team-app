@@ -2,7 +2,7 @@
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <AssemblyName>github-team</AssemblyName>
-    <RootNamespace>Aspire.TeamApp</RootNamespace>
+    <RootNamespace>GitHub.TeamApp</RootNamespace>
     <IsPackable>false</IsPackable>
     <IsAotCompatible>true</IsAotCompatible>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>

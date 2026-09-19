@@ -23,3 +23,72 @@ jobs:
         run: dotnet run --project tests/GitHub.TeamApp.Tests -- --filter-not-trait "quarantined=true" --filter-not-trait "outerloop=true"
       - name: Browser rendering tests
         run: node --test tests/browser/render.test.mjs
+      - name: Portable Windows shell policy tests
+        run: |
+          cmake -S desktop/windows -B obj/windows-policy-ci
+          cmake --build obj/windows-policy-ci --parallel
+          ctest --test-dir obj/windows-policy-ci --output-on-failure
+
+  macos-desktop:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Backend and launcher tests
+        run: dotnet run --project tests/GitHub.TeamApp.Tests -- --filter-not-trait "quarantined=true" --filter-not-trait "outerloop=true"
+      - name: Native shell policy tests
+        run: '"bin/Debug/net10.0/GitHub Team App.app/Contents/MacOS/GitHubTeamApp" --self-test'
+      - name: Publish native app bundle
+        shell: bash
+        run: |
+          if [ "$(uname -m)" = arm64 ]; then rid=osx-arm64; else rid=osx-x64; fi
+          dotnet publish GitHub.TeamApp.csproj -c Release -r "$rid" -p:PublishAot=true
+          codesign --verify --deep --strict "bin/Release/net10.0/$rid/publish/GitHub Team App.app"
+
+  windows-desktop:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Backend and launcher tests
+        run: dotnet run --project tests/GitHub.TeamApp.Tests -- --filter-not-trait "quarantined=true" --filter-not-trait "outerloop=true"
+      - name: Native CTest policy tests
+        shell: pwsh
+        run: ctest --test-dir obj/windows-desktop/x64 -C Release --output-on-failure
+      - name: Native shell policy tests
+        shell: pwsh
+        run: |
+          $shell = Join-Path $PWD 'bin/Debug/net10.0/GitHub Team App.exe'
+          if (-not (Test-Path -LiteralPath $shell -PathType Leaf)) {
+            throw "Native desktop shell is missing: $shell"
+          }
+          $process = Start-Process -FilePath $shell -ArgumentList '--self-test' -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Native shell policy tests failed with exit code $($process.ExitCode)"
+          }
+      - name: Publish native portable app
+        shell: pwsh
+        run: |
+          dotnet publish GitHub.TeamApp.csproj -c Release -r win-x64 -p:PublishAot=true
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $publish = Join-Path $PWD 'bin/Release/net10.0/win-x64/publish'
+          foreach ($name in @('github-team.exe', 'GitHub Team App.exe', 'WebView2.LICENSE.txt', 'WebView2.NOTICE.txt')) {
+            $file = Join-Path $publish $name
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+              throw "Published file is missing: $file"
+            }
+            if ((Get-Item -LiteralPath $file).Length -eq 0) {
+              throw "Published file is empty: $file"
+            }
+          }
+          if (Test-Path -LiteralPath (Join-Path $publish 'WebView2Loader.dll')) {
+            throw 'The desktop shell must use the static WebView2 loader, not a loader DLL.'
+          }
+          $process = Start-Process -FilePath (Join-Path $publish 'GitHub Team App.exe') -ArgumentList '--self-test' -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Published native shell policy tests failed with exit code $($process.ExitCode)"
+          }

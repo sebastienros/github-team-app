@@ -27,10 +27,11 @@ internal static class Program
                 Console.WriteLine("""
                     GitHub Team App
 
-                    github-team [--port PORT] [--no-browser] [--data-dir DIRECTORY]
+                    github-team [--port PORT] [--browser | --no-browser] [--data-dir DIRECTORY]
                     github-team doctor [--json]
 
-                    Serves the dashboard on loopback and opens your default browser.
+                    Opens a native desktop window on Windows and macOS (the default browser elsewhere).
+                    --browser explicitly opens the browser; --no-browser runs only the server.
                     The default port is assigned by the operating system.
                     GITHUB_TEAM_APP_HOME overrides the default preferences directory.
                     """);
@@ -38,6 +39,8 @@ internal static class Program
             }
             var port = 0;
             var browser = true;
+            var desktop = OperatingSystem.IsWindows() || OperatingSystem.IsMacOS();
+            var desktopManaged = false;
             var directory = Environment.GetEnvironmentVariable("GITHUB_TEAM_APP_HOME")
                 ?? Environment.GetEnvironmentVariable("ASPIRE_TEAM_APP_HOME")
                 ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "GitHub", "TeamApp");
@@ -53,11 +56,24 @@ internal static class Program
                         break;
                     case "--no-browser":
                         browser = false;
+                        desktop = false;
+                        break;
+                    case "--browser":
+                        browser = true;
+                        desktop = false;
+                        break;
+                    case "--desktop-managed":
+                        desktopManaged = true;
                         break;
                     default:
                         Console.Error.WriteLine($"Invalid argument: {args[i]}. Use --help for usage.");
                         return 2;
                 }
+            }
+            if (desktopManaged)
+            {
+                browser = false;
+                desktop = false;
             }
 
             var builder = WebApplication.CreateSlimBuilder();
@@ -80,6 +96,56 @@ internal static class Program
             await app.StartAsync(shutdown.Token);
             var address = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
             Console.WriteLine($"GitHub Team App: {address}");
+            if (desktopManaged)
+            {
+                var lifetime = app.Lifetime;
+                var stopping = lifetime.ApplicationStopping;
+                var logger = app.Logger;
+                // Console.In can read synchronously; a pool thread must not block startup or keep the process alive.
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        var line = await Console.In.ReadLineAsync();
+                        if (!stopping.IsCancellationRequested && line is not (null or "shutdown"))
+                        {
+                            logger.LogError("Unexpected desktop control input; shutting down.");
+                        }
+                    }
+                    catch (IOException error)
+                    {
+                        if (!stopping.IsCancellationRequested)
+                        {
+                            logger.LogError(error, "Could not read the desktop control pipe; shutting down.");
+                        }
+                    }
+                    finally
+                    {
+                        if (!stopping.IsCancellationRequested)
+                        {
+                            lifetime.StopApplication();
+                        }
+                    }
+                });
+            }
+            if (desktop)
+            {
+                using var desktopLifetime = CancellationTokenSource.CreateLinkedTokenSource(
+                    shutdown.Token, app.Lifetime.ApplicationStopping);
+                try
+                {
+                    await DesktopLauncher.RunAsync(address, desktopLifetime.Token);
+                }
+                catch (OperationCanceledException) when (desktopLifetime.IsCancellationRequested)
+                {
+                    // Closing the host also closes its owned desktop window.
+                }
+                finally
+                {
+                    await app.StopAsync(CancellationToken.None);
+                }
+                return 0;
+            }
             if (browser)
             {
                 try

@@ -15,4 +15,51 @@
     <EmbeddedResource Include="assets/*" LogicalName="Assets/%(Filename)%(Extension)" />
     <InternalsVisibleTo Include="GitHub.TeamApp.Tests" />
   </ItemGroup>
+  <Target Name="BuildMacDesktop" AfterTargets="Build"
+          Condition="$([MSBuild]::IsOSPlatform('OSX')) and '$(BuildDesktopShell)' != 'false' and ('$(RuntimeIdentifier)' == '' or $(RuntimeIdentifier.StartsWith('osx-')))"
+          Inputs="desktop/macos/main.swift;desktop/macos/Info.plist;desktop/macos/build.sh"
+          Outputs="$(TargetDir)GitHub Team App.app/Contents/MacOS/GitHubTeamApp">
+    <Exec Command="bash &quot;$(MSBuildProjectDirectory)/desktop/macos/build.sh&quot; &quot;$(TargetDir)&quot;" />
+  </Target>
+  <Target Name="PublishMacDesktop" AfterTargets="Publish"
+          Condition="$([MSBuild]::IsOSPlatform('OSX')) and '$(PublishAot)' == 'true' and '$(BuildDesktopShell)' != 'false' and ('$(RuntimeIdentifier)' == '' or $(RuntimeIdentifier.StartsWith('osx-')))">
+    <Exec Command="bash &quot;$(MSBuildProjectDirectory)/desktop/macos/build.sh&quot; &quot;$(PublishDir)&quot;" />
+    <Copy SourceFiles="$(PublishDir)github-team" DestinationFolder="$(PublishDir)GitHub Team App.app/Contents/Resources" />
+    <Exec Command="codesign --force --sign - &quot;$(PublishDir)GitHub Team App.app&quot;" />
+  </Target>
+  <Target Name="ConfigureWindowsDesktop"
+          Condition="$([MSBuild]::IsOSPlatform('Windows')) and '$(BuildDesktopShell)' != 'false' and ('$(RuntimeIdentifier)' == '' or $(RuntimeIdentifier.StartsWith('win-')))">
+    <PropertyGroup>
+      <_DesktopShellRuntimeIdentifier>$(RuntimeIdentifier)</_DesktopShellRuntimeIdentifier>
+      <_DesktopShellRuntimeIdentifier Condition="'$(_DesktopShellRuntimeIdentifier)' == ''">$(NETCoreSdkRuntimeIdentifier)</_DesktopShellRuntimeIdentifier>
+      <_DesktopShellArchitecture Condition="'$(_DesktopShellRuntimeIdentifier)' == 'win-x64'">x64</_DesktopShellArchitecture>
+      <_DesktopShellArchitecture Condition="'$(_DesktopShellRuntimeIdentifier)' == 'win-arm64'">arm64</_DesktopShellArchitecture>
+    </PropertyGroup>
+    <Error Condition="'$(_DesktopShellArchitecture)' == ''"
+           Text="The Windows desktop shell supports win-x64 and win-arm64 only. Use a supported RID, or set BuildDesktopShell=false and run with --browser or --no-browser." />
+  </Target>
+  <Target Name="BuildWindowsDesktop" AfterTargets="Build" DependsOnTargets="ConfigureWindowsDesktop"
+          Condition="$([MSBuild]::IsOSPlatform('Windows')) and '$(BuildDesktopShell)' != 'false' and ('$(RuntimeIdentifier)' == '' or $(RuntimeIdentifier.StartsWith('win-')))">
+    <PropertyGroup>
+      <_DesktopShellBuildDirectory>$([System.IO.Path]::GetFullPath('$(TargetDir)', '$(MSBuildProjectDirectory)'))</_DesktopShellBuildDirectory>
+    </PropertyGroup>
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)/desktop/windows/build.ps1&quot; -OutputDirectory &quot;$(_DesktopShellBuildDirectory)/.&quot; -Architecture $(_DesktopShellArchitecture)"
+          IgnoreExitCode="true">
+      <Output TaskParameter="ExitCode" PropertyName="_DesktopShellBuildExitCode" />
+    </Exec>
+    <Error Condition="'$(_DesktopShellBuildExitCode)' != '0'"
+           Text="Windows desktop shell build failed. Build on Windows with Visual Studio 2022/2026's C++ desktop workload, Windows SDK, and CMake installed; allow the pinned WebView2 SDK download. See the build output above. Use BuildDesktopShell=false for backend-only builds." />
+  </Target>
+  <Target Name="PublishWindowsDesktop" AfterTargets="Publish" DependsOnTargets="ConfigureWindowsDesktop"
+          Condition="$([MSBuild]::IsOSPlatform('Windows')) and '$(BuildDesktopShell)' != 'false' and ('$(RuntimeIdentifier)' == '' or $(RuntimeIdentifier.StartsWith('win-')))">
+    <PropertyGroup>
+      <_DesktopShellPublishDirectory>$([System.IO.Path]::GetFullPath('$(PublishDir)', '$(MSBuildProjectDirectory)'))</_DesktopShellPublishDirectory>
+    </PropertyGroup>
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)/desktop/windows/build.ps1&quot; -OutputDirectory &quot;$(_DesktopShellPublishDirectory)/.&quot; -Architecture $(_DesktopShellArchitecture)"
+          IgnoreExitCode="true">
+      <Output TaskParameter="ExitCode" PropertyName="_DesktopShellPublishExitCode" />
+    </Exec>
+    <Error Condition="'$(_DesktopShellPublishExitCode)' != '0'"
+           Text="Windows desktop shell publish failed. Build on Windows with Visual Studio 2022/2026's C++ desktop workload, Windows SDK, and CMake installed; allow the pinned WebView2 SDK download. See the build output above. Use BuildDesktopShell=false for backend-only publishing." />
+  </Target>
 </Project>

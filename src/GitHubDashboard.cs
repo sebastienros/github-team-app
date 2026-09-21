@@ -8,11 +8,23 @@ namespace GitHub.TeamApp;
 
 internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> logger)
 {
-    private const int MaxPages = 25;
+    internal const int MaxPages = 2000;
     private const string Separator = " \u00b7 ";
+    private readonly GitHubRepositorySync? itemSync;
 
-    public async Task<JsonObject> LoadAsync(IReadOnlyList<Account> accounts, JsonObject prefs, CancellationToken ct)
+    internal GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> logger, string cacheDirectory)
+        : this(http, logger, cacheDirectory, TimeProvider.System) { }
+
+    internal GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> logger, string cacheDirectory, TimeProvider clock)
+        : this(http, logger)
     {
+        itemSync = new GitHubRepositorySync(http, logger, cacheDirectory, clock);
+    }
+
+    public async Task<JsonObject> LoadAsync(IReadOnlyList<Account> accounts, JsonObject prefs, CancellationToken ct,
+        Action<SyncProgress>? progress = null)
+    {
+        var maxOpenItems = PreferenceStore.MaxOpenItems(prefs);
         var usable = accounts.Where(account => account.Active && account.Token.Length > 0 && account.Login.Length > 0).ToArray();
         if (usable.Length == 0)
         {
@@ -30,13 +42,14 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
         var repos = usable.SelectMany(account => account.Repos).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         using var concurrency = new SemaphoreSlim(8);
         var jobs = usable.SelectMany(account => account.Repos.Select(repo =>
-            LoadRepositoryAsync(account, repo, mode == "issues", viewers, concurrency, ct))).ToArray();
+            LoadRepositoryAsync(account, repo, mode == "issues", viewers, concurrency, ct, progress, maxOpenItems))).ToArray();
         var results = await Task.WhenAll(jobs).ConfigureAwait(false);
 
         // Merge after all workers settle: no shared mutable JsonNodes, and duplicate URL selection
         // follows account preference order rather than nondeterministic request completion order.
         var all = results.SelectMany(result => result.Items).DistinctBy(item => item.Text("url"))
-            .OrderByDescending(item => item.Date("updatedAt")).ToArray();
+            .OrderByDescending(item => item.Date("updatedAt")).ThenByDescending(item => item.Number("number")).ToArray();
+        var totalOpen = results.DistinctBy(result => (result.Host, result.Repo)).Sum(result => result.TotalOpen);
         var prs = mode == "issues" ? [] : all;
         var issues = mode == "issues" ? all : [];
         var successful = results.Where(result => result.Error is null).Select(result => (result.Host, result.Repo)).ToHashSet();
@@ -50,6 +63,12 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
             "ship" => BucketShip(prs, release, showDrafts, model),
             _ => BucketReview(prs, showDrafts, reviewLimit, model)
         };
+        foreach (var lane in lanes)
+        {
+            lane["items"] = JsonData.Array(lane["items"].Objects()
+                .OrderByDescending(card => (card["issue"] ?? card["pr"]).Date("updatedAt"))
+                .ThenByDescending(card => (card["issue"] ?? card["pr"]).Number("number")));
+        }
         return new JsonObject
         {
             ["authenticated"] = true,
@@ -58,6 +77,11 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
             ["mode"] = mode,
             ["release"] = release,
             ["repos"] = JsonData.Array(repos),
+            ["itemScope"] = new JsonObject
+            {
+                ["limit"] = maxOpenItems, ["loaded"] = all.Length, ["totalOpen"] = totalOpen,
+                ["limited"] = totalOpen > maxOpenItems
+            },
             ["lanes"] = JsonData.Array(lanes),
             ["attention"] = mode == "review" ? BuildAttention(prs, usable.Select(account => account.Login).ToArray(), reviewLimit, model) : null,
             ["notifications"] = JsonData.Array(BuildNotifications(prs, prefs["notifications"] as JsonObject ?? new JsonObject(),
@@ -81,10 +105,11 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
     }
 
     private async Task<RepositoryResult> LoadRepositoryAsync(Account account, string repo, bool issues,
-        HashSet<string> viewers, SemaphoreSlim concurrency, CancellationToken ct)
+        HashSet<string> viewers, SemaphoreSlim concurrency, CancellationToken ct, Action<SyncProgress>? progress, int limit)
     {
         var items = new List<JsonObject>();
         var host = account.Host;
+        var totalOpen = 0;
         await concurrency.WaitAsync(ct).ConfigureAwait(false);
         try
         {
@@ -94,13 +119,22 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
             {
                 throw new InvalidDataException($"Invalid repo \"{repo}\".");
             }
+            if (itemSync is not null)
+            {
+                var snapshot = await itemSync.LoadAsync(account, repo, issues, ct, progress, limit).ConfigureAwait(false);
+                items.AddRange(snapshot.Records.Select(node => issues
+                    ? NormalizeIssue(repo, node, viewers)
+                    : NormalizePr(repo, node, viewers, snapshot.IsPrivate)));
+                return new(host, repo, items, null, snapshot.TotalOpen);
+            }
             string? after = null;
             var cursors = new HashSet<string>();
             for (var page = 0; page < MaxPages; page++)
             {
                 var response = await GitHubDashboardTransport.QueryAsync(http, host, account.Token,
                     issues ? IssueQuery : PullRequestQuery,
-                    new JsonObject { ["owner"] = parts[0], ["name"] = parts[1], ["after"] = after }, ct).ConfigureAwait(false);
+                    new JsonObject { ["owner"] = parts[0], ["name"] = parts[1], ["after"] = after,
+                        ["first"] = Math.Min(40, limit - items.Count) }, ct).ConfigureAwait(false);
                 var repository = response["data"]?["repository"] as JsonObject ??
                     throw new InvalidDataException("Repository is unavailable or this account does not have access.");
                 if (!repository.Text("nameWithOwner", repo).Equals(repo, StringComparison.OrdinalIgnoreCase))
@@ -129,13 +163,17 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
                     }
                     items.Add(issues ? NormalizeIssue(repo, node, viewers) : NormalizePr(repo, node, viewers, repository.Flag("isPrivate")));
                 }
+                totalOpen = connection.Number("totalCount", items.Count);
+                progress?.Invoke(new("Downloading open items", items.Count,
+                    Math.Min(limit, totalOpen), issues ? "issues" : "PRs", true));
                 if (connection["pageInfo"] is not JsonObject pageInfo)
                 {
                     throw new InvalidDataException("GitHub returned a repository connection without pagination metadata.");
                 }
-                if (!pageInfo.Flag("hasNextPage"))
+                if (!pageInfo.Flag("hasNextPage") || items.Count >= limit)
                 {
-                    return new(host, repo, items, null);
+                    return new(host, repo, items.OrderByDescending(node => node.Date("updatedAt"))
+                        .ThenByDescending(node => node.Number("number")).Take(limit).ToList(), null, totalOpen);
                 }
                 after = pageInfo.Text("endCursor");
                 if (after.Length == 0 || !cursors.Add(after))
@@ -150,7 +188,7 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
             var message = GitHubDashboardTransport.Redact(
                 $"{repo} ({host}): {(ex is TaskCanceledException ? "GitHub request timed out." : ex.Message)}", account.Token);
             logger.LogWarning("GitHub repository load failed: {Reason}", message);
-            return new(host, repo, items, message);
+            return new(host, repo, items, message, totalOpen);
         }
         finally
         {
@@ -244,7 +282,7 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
         return pr;
     }
 
-    private static JsonObject NormalizeIssue(string repo, JsonObject node, HashSet<string> viewers)
+    internal static JsonObject NormalizeIssue(string repo, JsonObject node, HashSet<string> viewers)
     {
         var author = node["author"].Text("login", "ghost");
         var assignees = Nodes(node, "assignees").Select(assignee => assignee.Text("login")).ToArray();
@@ -589,19 +627,26 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
         }
     }
 
-    private sealed record RepositoryResult(string Host, string Repo, List<JsonObject> Items, string? Error);
+    private sealed record RepositoryResult(string Host, string Repo, List<JsonObject> Items, string? Error, int TotalOpen);
 
-    private const string PullRequestQuery = """
-        query($owner:String!, $name:String!, $after:String) {
+    internal const string PullRequestQuery = """
+        query($owner:String!, $name:String!, $after:String, $first:Int!) {
           repository(owner:$owner, name:$name) {
             nameWithOwner isPrivate
-            pullRequests(states:OPEN, first:40, after:$after, orderBy:{field:UPDATED_AT, direction:DESC}) {
-              pageInfo { hasNextPage endCursor }
+            pullRequests(states:OPEN, first:$first, after:$after, orderBy:{field:UPDATED_AT, direction:DESC}) {
+              totalCount pageInfo { hasNextPage endCursor }
               nodes {
-                number title url isDraft state createdAt updatedAt
+        """ + PullRequestSelection + """
+              }
+            }
+          }
+        }
+        """;
+
+    internal const string PullRequestSelection = """
+                title isDraft state createdAt
                 author { __typename login avatarUrl }
-                baseRefName mergeable reviewDecision
-                baseRef { branchProtectionRule { requiresConversationResolution } }
+                baseRefName
                 readyForReviewEvents: timelineItems(last:1, itemTypes:[READY_FOR_REVIEW_EVENT]) {
                   nodes { ... on ReadyForReviewEvent { createdAt } }
                 }
@@ -609,30 +654,39 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
                 milestone { title }
                 labels(first:15) { nodes { name } }
                 assignees(first:10) { nodes { login } }
-                reviewRequests(first:20) { nodes { requestedReviewer { __typename ... on User { login } } } }
-                reviews(first:60) { nodes { state author { login } submittedAt } }
-                reviewThreads(first:60) { nodes { isResolved } }
-                commits(last:1) { totalCount nodes { commit { committedDate statusCheckRollup { state } } } }
                 closingIssuesReferences(first:10) {
                   nodes {
                     number title url repository { nameWithOwner } milestone { title }
                     labels(first:15) { nodes { name } }
                   }
                 }
+        """ + PullRequestLiveSelection;
+
+    internal const string PullRequestLiveSelection = """
+                number url updatedAt headRefOid mergeable reviewDecision
+                baseRef { branchProtectionRule { requiresConversationResolution } }
+                reviewRequests(first:20) { nodes { requestedReviewer { __typename ... on User { login } } } }
+                reviews(first:60) { nodes { state author { login } submittedAt } }
+                reviewThreads(first:60) { nodes { isResolved } }
+                commits(last:1) { totalCount nodes { commit { committedDate statusCheckRollup { state } } } }
+        """;
+
+    internal const string IssueQuery = """
+        query($owner:String!, $name:String!, $after:String, $first:Int!) {
+          repository(owner:$owner, name:$name) {
+            nameWithOwner
+            issues(states:OPEN, first:$first, after:$after, orderBy:{field:UPDATED_AT, direction:DESC}) {
+              totalCount pageInfo { hasNextPage endCursor }
+              nodes {
+        """ + IssueSelection + """
               }
             }
           }
         }
         """;
 
-    private const string IssueQuery = """
-        query($owner:String!, $name:String!, $after:String) {
-          repository(owner:$owner, name:$name) {
-            nameWithOwner
-            issues(states:OPEN, first:40, after:$after, orderBy:{field:UPDATED_AT, direction:DESC}) {
-              pageInfo { hasNextPage endCursor }
-              nodes {
-                number title url createdAt updatedAt
+    internal const string IssueSelection = """
+                number title url state createdAt updatedAt
                 author { __typename login avatarUrl }
                 milestone { title }
                 labels(first:15) { nodes { name } }
@@ -640,9 +694,5 @@ internal sealed class GitHubDashboard(HttpClient http, ILogger<GitHubDashboard> 
                 closedByPullRequestsReferences(first:5, includeClosedPrs:true) {
                   nodes { number title url state repository { nameWithOwner } }
                 }
-              }
-            }
-          }
-        }
         """;
 }

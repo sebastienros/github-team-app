@@ -7,7 +7,7 @@ function apiFetch(path, options = {}) {
     ? { ...options, headers: { ...options.headers, "X-Team-App-Client": dashboardClient } }
     : options);
 }
-// Deterministic top progress bar element (lives outside #app so re-renders don't drop it).
+// Lives outside #app so navigation does not interrupt progress.
 const loadbar = document.getElementById("loadbar");
 let state = null;
 let prefs = null;
@@ -17,6 +17,7 @@ let selectionQueue = Promise.resolve();
 let discoveredAccounts = null;
 let accountsScanned = false;
 let accountScanGeneration = 0;
+let accountScanController = null;
 let repositoryAccount = "";
 let repositoryQuery = "";
 let repositoryResults = [];
@@ -72,6 +73,7 @@ function adoptState(payload) {
   if (state && Array.isArray(state.accounts)) discoveredAccounts = state.accounts;
   loadError = null;
   adoptAppliedRev();
+  syncFromDashboard(state);
   const appliedSeq = state && state.seq;
   if (!updateAvailable || typeof appliedSeq !== "number" || appliedSeq >= updateAvailable.seq) {
     updateAvailable = null;
@@ -84,19 +86,21 @@ function matchesRepository(payload) {
   if (!prefs || !Object.hasOwn(prefs, "selectedRepository")) return true;
   const id = prefs.selectedRepository || "";
   return payload.dashboard.repositoryId === id
+    && (!state?.mode || !payload.dashboard.mode || payload.dashboard.mode === state.mode)
     && (!payload.prefs || payload.prefs.selectedRepository === id);
 }
 function currentAccounts() {
   return discoveredAccounts || (state && state.accounts) || [];
 }
-function repositoryPicker() {
-  const repositories = prefs?.repositories || [];
-  return '<label class="project-picker" for="repository-picker">Project<select id="repository-picker" aria-label="Selected repository"' + (repositorySaving ? " disabled" : "") + '>' +
-    '<option value=""' + (prefs?.selectedRepository ? " disabled" : " selected") + '>No repository selected</option>' +
-    repositories.map(repo => '<option value="' + esc(repo.id) + '"' +
-      (repo.id === prefs.selectedRepository ? " selected" : "") + '>' +
-      esc(repo.repository + " (" + repo.host + ")") + "</option>").join("") +
-    '</select></label><button class="btn ghost" id="repositories-btn" type="button">Repositories</button>';
+function repositoryChip() {
+  const selected = (prefs?.repositories || []).find(repo => repo.id === prefs?.selectedRepository);
+  const name = selected?.repository || "Repositories";
+  const title = selected ? selected.repository + " (" + selected.host + ") - Select and manage repositories" : "Select and manage repositories";
+  return '<button class="acct-chip repo-chip ' + (view === "repositories" ? "active" : "") +
+    '" id="repositories-btn" type="button" title="' + esc(title) + '" aria-label="' +
+    esc(selected ? name + " - Repositories" : name) + '" aria-expanded="' + (view === "repositories") + '"' +
+    (repositorySaving ? " disabled" : "") + '>' + ICONS.layers + '<span class="name">' + esc(name) +
+    "</span>" + ICONS.chev + "</button>";
 }
 function emptyDashboard(id) {
   return {
@@ -108,8 +112,6 @@ function emptyDashboard(id) {
 }
 async function selectRepository(id) {
   if (!id) {
-    const picker = document.getElementById("repository-picker");
-    if (picker) picker.value = prefs?.selectedRepository || "";
     if (prefs?.selectedRepository) {
       loadError = "Choose a repository from the list.";
       render();
@@ -117,16 +119,22 @@ async function selectRepository(id) {
     return;
   }
   if (repositorySaving) return;
+  if (view === "repositories" && id === prefs?.selectedRepository && state?.repositoryId === id && !selectionPending && !loadError) {
+    goView("queue", false);
+    return;
+  }
   const generation = ++scopeGeneration;
   selectionPending = true;
   prefs = { ...(prefs || {}), selectedRepository: id };
   state = emptyDashboard(id);
+  resetSyncProgress();
+  syncFromDashboard(state);
   pendingState = null;
   updateAvailable = null;
   lastAppliedSeq = -1;
   loadError = null;
   cancelRepositorySearch();
-  render();
+  goView("queue", false);
   // Serialize writes as well as guarding reads: the persisted selection must finish on B,
   // even when A was already on the wire when the user selected B.
   const request = selectionQueue.then(() => generation === scopeGeneration
@@ -142,6 +150,7 @@ async function selectRepository(id) {
     if (generation === scopeGeneration) {
       state = { ...state, loading: false, refreshing: false };
       loadError = "Could not select repository: " + (error.message || String(error));
+      finishSyncProgress(loadError);
     }
   } finally {
     if (generation === scopeGeneration) {
@@ -232,6 +241,7 @@ async function mutateRepository(action, value) {
       pendingState = null;
       updateAvailable = null;
       lastAppliedSeq = -1;
+      resetSyncProgress();
     }
     if (matchesRepository(data) && (typeof data.dashboard.seq !== "number" || data.dashboard.seq > lastAppliedSeq)) adoptState(data);
     repositoryQuery = "";
@@ -247,13 +257,13 @@ function repositoriesView() {
   const accounts = currentAccounts().filter(a => a.status !== "failed");
   const repositories = prefs?.repositories || [];
   return '<div class="page"><div class="page-head"><h2>Repositories</h2>' +
-    '<p>Choose one repository in the header to scope Review, Issues, Ship, and Health.</p></div>' +
+    '<p>Select a repository below to open its Review, Issues, Ship, or Health dashboard. Use the repository button to return here and manage your saved list.</p></div>' +
     '<div class="section"><h3>Your repositories</h3><ul class="repository-results">' +
     (repositories.length ? repositories.map(repo =>
       '<li class="repository-result"><div><b>' + esc(repo.repository) + '</b><p>' + esc(repo.host) +
       ' &middot; ' + esc(repo.accountId) + '</p></div><div class="row-actions">' +
       '<button class="btn ghost" type="button" data-repository-select="' + esc(repo.id) + '"' + (repositorySaving ? " disabled" : "") + '>' +
-      (repo.id === prefs.selectedRepository ? "Selected" : "Select") + '</button>' +
+      (repo.id === prefs.selectedRepository ? "Open selected" : "Select") + '</button>' +
       '<button class="btn ghost" type="button" data-repository-remove="' + esc(repo.id) + '"' +
       (repositorySaving || selectionPending ? " disabled" : "") + ' aria-label="Remove ' + esc(repo.repository) +
       '">Remove</button></div></li>').join("") : '<li class="repo-empty">No repositories yet. Add one below.</li>') +
@@ -274,10 +284,8 @@ function wireRepositoryResults() {
     button.addEventListener("click", () => mutateRepository("add", button.dataset.repositoryAdd)));
 }
 function wireRepositories() {
-  const picker = document.getElementById("repository-picker");
-  if (picker) picker.addEventListener("change", () => selectRepository(picker.value));
   const manage = document.getElementById("repositories-btn");
-  if (manage) manage.addEventListener("click", () => goView("repositories"));
+  if (manage) manage.addEventListener("click", () => goView(view === "repositories" ? "queue" : "repositories"));
   const accounts = document.getElementById("repository-accounts");
   if (accounts) accounts.addEventListener("click", () => goView("accounts"));
   const account = document.getElementById("repository-account");
@@ -313,6 +321,7 @@ let draggedHealthId = null;
 let healthOrderSaving = false;
 let healthOrderAnnouncement = "";
 let sessionSettingsError = "";
+let settingsError = "";
 let sessionSettingsSaving = false;
 let doctorResult = null;
 let doctorRunning = false;
@@ -434,13 +443,14 @@ async function readJson(res) {
   return data;
 }
 
-async function load() {
+async function load(preserveForm = false) {
   // Capture the applied revision at request start. GET /api/state may be served stale-while-
   // revalidate and can still be in flight when an SSE 'state' event (applyPushedState) applies a
   // newer snapshot. If the GET then fails, publishing its error would paint a failure banner over
   // that newer valid state. Suppress the failure when a newer revision was applied after this
   // request started (the withRefresh catch gates the same class of race with its refreshGen id).
   const startSeq = lastAppliedSeq;
+  const startProgressRevision = progressRevision;
   const generation = scopeGeneration;
   let changed = false;
   try {
@@ -453,23 +463,31 @@ async function load() {
     // state/lastAppliedSeq backward. Mirrors the withRefresh/applyPushedState gate.
     const seq = data.dashboard && data.dashboard.seq;
     if (typeof seq !== "number" || seq > lastAppliedSeq) {
+      if (preserveForm && state && view !== "queue") {
+        applyPushedState(data);
+        return;
+      }
       adoptState(data);
       changed = true;
+    } else if (seq === lastAppliedSeq) {
+      syncFromDashboard(data.dashboard);
     }
   } catch (e) {
     // Only publish this failure if no newer revision was applied while the GET was pending. A late
     // failure from a superseded request must not clobber the newer valid state (or its banner).
-    if (generation === scopeGeneration && lastAppliedSeq === startSeq) {
+    if (generation === scopeGeneration && lastAppliedSeq === startSeq && progressRevision === startProgressRevision) {
       loadError = String((e && e.message) || e);
+      finishSyncProgress(loadError);
       changed = true;
     }
   }
-  if (changed) render(); else updateRefreshControls();
+  if (changed && !(preserveForm && state && view !== "queue")) render(); else updateRefreshControls();
 }
 
 async function withRefresh(fn) {
   const myGen = ++refreshGen;
   const generation = scopeGeneration;
+  const startProgressRevision = progressRevision;
   let changed = false;
   refreshInFlight++;
   refreshing = true; setLoading(true); beginProgress();
@@ -484,26 +502,26 @@ async function withRefresh(fn) {
       if (typeof seq !== "number" || seq > lastAppliedSeq) {
         adoptState(data);
         changed = true;
+      } else if (seq === lastAppliedSeq) {
+        syncFromDashboard(data.dashboard);
       }
     }
   } catch (e) {
     // Publish this failure only if no newer refresh has started since. A late rejection from an
     // older overlapping refresh must not clobber the newer operation's state/banner — the success
     // path is seq-gated for the same reason, but rejections carry no seq, so gate on refreshGen.
-    if (generation === scopeGeneration && myGen === refreshGen) {
+    if (generation === scopeGeneration && myGen === refreshGen && progressRevision === startProgressRevision) {
       loadError = String((e && e.message) || e);
+      finishSyncProgress(loadError);
       changed = true;
     }
   } finally {
     refreshInFlight--;
-    // Only the last overlapping refresh winds down the shared UI. If an earlier one finished
-    // this while a later forced load is still running, we must NOT clear refreshing or fade
-    // the bar out from under it — just re-render to show whatever data this call applied.
-    // The SSE 'progress' stream is the normal bar driver (setProgress -> endProgress at
-    // done>=total); ending here is the backstop for when it never delivers a terminal event
-    // (SSE disconnected, or this refresh joined a background compute started with
-    // progress:false, which emits no progress events).
-    if (refreshInFlight === 0) { refreshing = false; endProgress(); }
+    // Standalone HTTP responses acknowledge a background job, not its completion.
+    if (refreshInFlight === 0) {
+      refreshing = false;
+      if (!syncActive) endProgress(!!syncError);
+    }
     if (changed) render(); else updateRefreshControls();
   }
 }
@@ -514,9 +532,10 @@ function setLoading(on) {
 }
 
 function updateRefreshControls() {
+  renderSyncProgress();
   const rb = document.getElementById("refresh-btn");
   if (rb) {
-    rb.classList.toggle("spin", refreshing || !!state?.refreshing);
+    rb.classList.toggle("spin", refreshing || syncActive || (!syncProgress && !!state?.refreshing));
     const tooltip = refreshTooltip();
     rb.dataset.tooltip = tooltip;
     rb.setAttribute("aria-label", tooltip);
@@ -541,26 +560,166 @@ function updateRefreshControls() {
   }
 }
 
-/* ---- deterministic progress bar ----
-   Driven by SSE 'progress' events ({ done, total }). beginProgress shows a small sliver
-   for instant feedback; setProgress advances the fill; endProgress completes to 100% then
-   fades. All are no-ops when #loadbar is absent (e.g. the render test harness). */
+/* ---- scoped synchronization progress ---- */
+let syncProgress = null;
+let syncActive = false;
+let syncError = "";
+let progressRevision = -1;
+const retiredSyncIds = new Set();
 let progFadeTimer = null;
 let progResetTimer = null;
-function beginProgress() {
-  if (!loadbar) return;
+const progressPhases = {
+  authenticating: "Checking GitHub credentials",
+  discovery: "Discovering repository",
+  "initial-items": "Fetching repository items",
+  changes: "Fetching changes",
+  "live-state": "Checking live pull request state",
+  saving: "Saving repository data",
+  complete: "Sync complete",
+  error: "Sync failed",
+};
+function resetSyncProgress() {
+  if (syncProgress) retiredSyncIds.add(syncProgress.syncId);
+  syncProgress = null;
+  syncActive = false;
+  syncError = "";
+  progressRevision = -1;
+  clearProgressTimers();
+  if (loadbar) {
+    loadbar.classList.remove("active", "indeterminate");
+    loadbar.style.width = "0";
+  }
+  renderSyncProgress();
+}
+function matchesProgressScope(p) {
+  // Do not let the first untrusted stream tick choose the selected repository.
+  return !!state && !!prefs && p?.repositoryId === state.repositoryId
+    && p.repositoryId === prefs.selectedRepository && p.mode === state.mode;
+}
+function onProgress(p) {
+  if (!p || typeof p !== "object") return;
+  if (!standalone && !Object.hasOwn(p, "repositoryId") && !Object.hasOwn(prefs || {}, "selectedRepository")) {
+    setProgress(p.done, p.total);
+    return;
+  }
+  if (!matchesProgressScope(p) || !Number.isSafeInteger(p.revision) || p.revision < 0
+    || typeof p.syncId !== "string" || !p.syncId || p.revision <= progressRevision
+    || retiredSyncIds.has(p.syncId)) return;
+  if (syncProgress && syncProgress.syncId !== p.syncId) retiredSyncIds.add(syncProgress.syncId);
+  progressRevision = p.revision;
+  syncProgress = { ...p };
+  syncError = p.phase === "error" ? "Sync failed. Retry to continue." : "";
+  syncActive = !p.complete && p.phase !== "complete" && p.phase !== "error";
+  if (!syncActive) {
+    retiredSyncIds.add(p.syncId);
+    state = { ...state, refreshing: false, loading: false };
+    endProgress(!!syncError);
+  }
+  updateRefreshControls();
+}
+function syncFromDashboard(dashboard) {
+  const p = dashboard?.syncProgress;
+  if (p && matchesProgressScope(p)) {
+    // An HTTP snapshot can arrive after newer progress from the stream.
+    if (p.revision < progressRevision
+      || (retiredSyncIds.has(p.syncId) && p.syncId !== syncProgress?.syncId)) return;
+    onProgress(p);
+  }
+  if (dashboard.refreshing === false) {
+    finishSyncProgress(dashboard.refreshError || (p?.phase === "error" ? syncError || "Sync failed. Retry to continue." : ""));
+  } else if (dashboard.refreshing || dashboard.loading) {
+    if (!p && !syncProgress?.complete) {
+      syncActive = true;
+      syncError = "";
+    }
+    renderSyncProgress();
+  }
+}
+function finishSyncProgress(error) {
+  syncActive = false;
+  syncError = error;
+  if (syncProgress) {
+    retiredSyncIds.add(syncProgress.syncId);
+    syncProgress = { ...syncProgress, complete: true, phase: error ? "error" : "complete" };
+  }
+  if (state) state = { ...state, refreshing: false, loading: false };
+  endProgress(!!error);
+  renderSyncProgress();
+}
+function syncProgressHtml() {
+  return '<section id="sync-progress" class="sync-progress" hidden aria-label="Repository synchronization">' +
+    '<div id="sync-progress-status" role="status" aria-live="polite" aria-atomic="true"></div>' +
+    '<progress id="sync-progress-bar" aria-label="Repository sync phase"></progress>' +
+    '<p id="sync-progress-detail" class="sync-progress-detail"></p></section>';
+}
+function renderSyncProgress() {
+  const section = document.getElementById("sync-progress");
+  const status = document.getElementById("sync-progress-status");
+  const bar = document.getElementById("sync-progress-bar");
+  const detail = document.getElementById("sync-progress-detail");
+  const p = syncProgress;
+  const initial = p?.initial ?? (state?.cacheStatus === "loading");
+  const known = Number.isFinite(p?.total) && p.total >= 0 && Number.isFinite(p?.done) && p.done >= 0;
+  const count = known ? p.done + " of " + p.total + " " + String(p.unit || "items")
+    : Number.isFinite(p?.done) && p.done > 0 ? p.done + " " + String(p.unit || "items") + " fetched" : "";
+  const phase = syncError ? "Sync failed" : !syncActive ? "Sync complete"
+    : Object.hasOwn(progressPhases, p?.phase) ? progressPhases[p.phase]
+    : p?.phase ? String(p.phase).replace(/[-_]/g, " ") : "Preparing sync";
+  const text = (initial ? "Initial sync" : "Repository sync") + ": " + phase + (count && syncActive ? " - " + count : "");
+  // Once a phase's items are fetched, saving/enrichment still has to finish. Do not
+  // present a full overall bar before the completed dashboard is committed.
+  const determinate = known && p.total > 0 && p.done < p.total;
+  if (section) {
+    section.hidden = !syncActive && !p && !syncError;
+    section.classList.toggle("initial", !!initial && syncActive);
+    section.classList.toggle("failed", !!syncError);
+  }
+  if (status && status.textContent !== text) status.textContent = text;
+  if (detail) detail.textContent = syncError || (initial && syncActive
+    ? "Large repositories can take a while on the first sync. Counts reflect the current phase; data is ready after saving."
+    : "");
+  if (bar) {
+    bar.hidden = !syncActive;
+    bar.setAttribute("aria-busy", syncActive ? "true" : "false");
+    bar.setAttribute("aria-valuetext", text);
+    if (determinate) {
+      bar.max = p.total;
+      bar.value = p.done;
+      bar.setAttribute("aria-valuemin", "0");
+      bar.setAttribute("aria-valuemax", String(p.total));
+      bar.setAttribute("aria-valuenow", String(p.done));
+    } else {
+      bar.removeAttribute("value");
+      bar.removeAttribute("aria-valuemin");
+      bar.removeAttribute("aria-valuemax");
+      bar.removeAttribute("aria-valuenow");
+    }
+  }
+  if (syncActive && loadbar) {
+    beginProgress();
+    loadbar.classList.toggle("indeterminate", !determinate);
+    loadbar.style.width = determinate ? (p.done / p.total * 100) + "%" : "100%";
+  }
+}
+function clearProgressTimers() {
   if (progFadeTimer) { clearTimeout(progFadeTimer); progFadeTimer = null; }
   if (progResetTimer) { clearTimeout(progResetTimer); progResetTimer = null; }
+}
+function beginProgress() {
+  if (!loadbar) return;
+  clearProgressTimers();
   loadbar.classList.add("active");
-  const w = parseFloat(loadbar.style.width) || 0;
-  // Start (or restart from a faded-out state) with a visible sliver.
-  if (w <= 0 || w >= 100) loadbar.style.width = "8%";
+  if (!syncActive) {
+    loadbar.classList.add("indeterminate");
+    loadbar.style.width = "100%";
+  }
 }
 function setProgress(done, total) {
   if (!loadbar) return;
   beginProgress();
-  const pct = total > 0 ? Math.max(8, Math.min(100, Math.round((done / total) * 100))) : 8;
-  loadbar.style.width = pct + "%";
+  const known = Number.isFinite(total) && total > 0 && Number.isFinite(done);
+  loadbar.classList.toggle("indeterminate", !known);
+  loadbar.style.width = known ? Math.max(0, Math.min(100, done / total * 100)) + "%" : "100%";
   // Only fade on a terminal tick when this is the last in-flight refresh. Forced computes are
   // serialized server-side, so when two withRefresh() calls overlap the FIRST compute emits its
   // done>=total tick while the second is still fetching; fading here would bypass the counter's
@@ -568,14 +727,14 @@ function setProgress(done, total) {
   // tick. withRefresh's finally (endProgress at refreshInFlight === 0) remains the backstop.
   if (total > 0 && done >= total && refreshInFlight <= 1) { endProgress(); }
 }
-function endProgress() {
+function endProgress(failed = false) {
   if (!loadbar) return;
   // Clear any in-flight fade/reset timers so a second call (SSE completion followed by the
   // withRefresh finally backstop, or vice versa) can't leave a dangling timer that fires a
   // duplicate fade after the bar has already reset.
-  if (progFadeTimer) { clearTimeout(progFadeTimer); progFadeTimer = null; }
-  if (progResetTimer) { clearTimeout(progResetTimer); progResetTimer = null; }
-  loadbar.style.width = "100%";
+  clearProgressTimers();
+  loadbar.classList.remove("indeterminate");
+  loadbar.style.width = failed ? "0" : "100%";
   // Fill to 100%, hold briefly, fade out, then reset width so the next cycle grows from
   // the left again rather than snapping back visibly.
   progFadeTimer = setTimeout(() => {
@@ -588,14 +747,18 @@ function endProgress() {
 // edit: while off the queue we stash it (applied on return); duplicate final snapshots are
 // dropped; and scroll position is preserved across the re-render.
 function applyPushedState(payload) {
+  if (standalone && (!prefs || !state)) return;
   if (!matchesRepository(payload)) return;
   const seq = payload.dashboard.seq;
   if (typeof seq === "number" && seq <= lastAppliedSeq) {
     // Stale or duplicate: the request response may have already applied this snapshot, or an older
     // overlapping request settled late. Never overwrite the newer state already on screen.
+    if (seq === lastAppliedSeq) syncFromDashboard(payload.dashboard);
     return;
   }
   if (view !== "queue") {
+    // Progress is safe to update even while the complete dashboard waits behind a form.
+    syncFromDashboard(payload.dashboard);
     if (!pendingState || typeof seq !== "number" || seq > (pendingState.dashboard.seq ?? -1)) pendingState = payload;
     return;
   }
@@ -605,6 +768,7 @@ function applyPushedState(payload) {
   if (healthOrderSaving && sameRenderedHealthDashboard(state, payload.dashboard)) {
     state = payload.dashboard; prefs = payload.prefs; loadError = null;
     adoptAppliedRev();
+    syncFromDashboard(state);
     return;
   }
   applyState(payload);
@@ -630,13 +794,19 @@ async function postJSON(path, body) {
 }
 
 function onUpdateAvailable(payload) {
+  if (standalone && (!prefs || !state)) return;
   if (prefs && Object.hasOwn(prefs, "selectedRepository") && payload?.repositoryId !== prefs.selectedRepository) return;
-  if (!payload || typeof payload.seq !== "number" || payload.seq <= lastAppliedSeq) return;
+  if (!payload) return;
+  if (payload.mode && state?.mode && payload.mode !== state.mode) return;
+  if (payload.syncId && syncProgress && payload.syncId !== syncProgress.syncId) return;
+  if (payload.syncProgress) onProgress(payload.syncProgress);
+  if (typeof payload.seq !== "number" || payload.seq <= lastAppliedSeq) return;
   if (!updateAvailable || payload.seq > updateAvailable.seq) updateAvailable = payload;
   updateRefreshControls();
 }
 
 function onPreferences(nextPrefs) {
+  if (standalone && (!prefs || !state)) return;
   if (!nextPrefs || typeof nextPrefs !== "object") return;
   if (prefs && Object.hasOwn(prefs, "selectedRepository") && nextPrefs.selectedRepository !== prefs.selectedRepository) return;
   const wasEnabled = autoApplyEnabled();
@@ -648,14 +818,88 @@ function onPreferences(nextPrefs) {
 }
 
 function onSnapshot(payload) {
-  if (prefs && Object.hasOwn(prefs, "selectedRepository") && payload?.repositoryId !== prefs.selectedRepository) return;
+  const dashboard = payload?.dashboard;
+  const metadata = dashboard || payload;
+  if (prefs && Object.hasOwn(prefs, "selectedRepository")
+    && metadata?.repositoryId !== prefs.selectedRepository) return;
+  const mode = metadata?.mode || payload?.prefs?.mode || metadata?.syncProgress?.mode;
+  if (state?.mode && mode && mode !== state.mode) return;
+  if (!payload) return;
+  if (!state || !prefs) {
+    if (dashboard && payload.prefs
+      && dashboard.repositoryId === payload.prefs.selectedRepository) {
+      applyState(payload);
+    } else {
+      // A metadata-only replay cannot choose the scope before the initial GET.
+      load(true);
+    }
+    return;
+  }
+  const p = metadata.syncProgress;
+  // A snapshot is an authoritative stream handshake, unlike a delayed HTTP response.
+  // A new service starts its sequence at zero; discard the old ordering watermark.
+  const restarted = p
+    ? matchesProgressScope(p) && p.revision < progressRevision
+      && p.syncId !== syncProgress?.syncId && !retiredSyncIds.has(p.syncId)
+    : standalone && typeof metadata.seq === "number" && metadata.seq < lastAppliedSeq;
+  if (restarted) {
+    ++scopeGeneration;
+    resetSyncProgress();
+    lastAppliedSeq = -1;
+    pendingState = null;
+    updateAvailable = null;
+  }
+  if (p) onProgress(p);
+  if (metadata.refreshError || metadata.refreshing === false) syncFromDashboard(metadata);
   onPollSchedule(payload);
-  if (!payload || typeof payload.seq !== "number" || payload.seq <= lastAppliedSeq) return;
+  if (dashboard) {
+    if (payload.prefs && payload.prefs.selectedRepository === prefs.selectedRepository) prefs = payload.prefs;
+    if (autoApplyEnabled() || state.loading) applyPushedState(payload);
+    else onUpdateAvailable({ ...dashboard, prefs: payload.prefs });
+    return;
+  }
+  if (typeof payload.seq !== "number" || payload.seq <= lastAppliedSeq) return;
   if (payload.prefs && typeof payload.prefs === "object") prefs = payload.prefs;
   // Initial load already reads the complete cache. On reconnect, replay either applies the missed
   // state automatically or restores the pending-update affordance without touching the board.
-  if (!state) return;
-  if (autoApplyEnabled()) load(); else onUpdateAvailable(payload);
+  if (autoApplyEnabled()) load(true); else onUpdateAvailable(payload);
+}
+
+async function onRefreshError(data) {
+  if (!state || !prefs || data?.repositoryId !== prefs.selectedRepository) return;
+  if (data.syncId && syncProgress && data.syncId !== syncProgress.syncId) return;
+  if (!data.mode && !data.syncProgress) {
+    // Repository-only errors have no attempt/mode identity. Read the current scope
+    // rather than letting a delayed notification terminate a newer attempt.
+    const generation = scopeGeneration;
+    const revision = progressRevision;
+    try {
+      const payload = await readJson(await apiFetch("api/state"));
+      if (generation !== scopeGeneration || !matchesRepository(payload)) return;
+      const dashboard = payload.dashboard;
+      if (typeof dashboard.seq === "number" && dashboard.seq < lastAppliedSeq) return;
+      if (dashboard.syncProgress && !matchesProgressScope(dashboard.syncProgress)) return;
+      if (progressRevision !== revision && (!dashboard.syncProgress
+        || dashboard.syncProgress.revision < progressRevision)) return;
+      syncFromDashboard(dashboard);
+      if (dashboard.refreshing === false && dashboard.refreshError && !syncActive) loadError = dashboard.refreshError;
+      updateRefreshControls();
+    } catch (error) {
+      console.error("Could not reconcile sync error", error);
+    }
+    return;
+  }
+  if (!matchesProgressScope(data)) return;
+  if (Number.isSafeInteger(data.revision) && data.revision < progressRevision) return;
+  if (data.syncProgress) {
+    if (!matchesProgressScope(data.syncProgress)
+      || data.syncProgress.revision < progressRevision
+      || (retiredSyncIds.has(data.syncProgress.syncId) && data.syncProgress.syncId !== syncProgress?.syncId)) return;
+    onProgress(data.syncProgress);
+  } else if (data.syncId && syncProgress && data.syncId !== syncProgress.syncId) return;
+  loadError = data.error;
+  finishSyncProgress(data.error || "Sync failed. Retry to continue.");
+  updateRefreshControls();
 }
 
 function onPollSchedule(payload) {
@@ -681,11 +925,13 @@ async function applyAvailableUpdate() {
     if (view !== "queue") {
       pendingState = data;
       prefs = data.prefs;
+      syncFromDashboard(data.dashboard);
       updateAvailable = null;
     } else if (typeof seq !== "number" || seq > lastAppliedSeq) {
       applyState(data);
     } else {
       prefs = data.prefs;
+      if (seq === lastAppliedSeq) syncFromDashboard(data.dashboard);
       updateAvailable = null;
     }
   } catch (e) {
@@ -736,7 +982,20 @@ async function openLinkedPr(link) {
 }
 
 const refresh = () => withRefresh(() => postJSON("api/refresh"));
-const setMode = (mode) => { if (state && state.mode === mode) return; goView("queue", false); return withRefresh(() => postJSON("api/mode", { mode })); };
+const setMode = (mode) => {
+  if (state && state.mode === mode) return;
+  ++scopeGeneration;
+  pendingState = null;
+  updateAvailable = null;
+  lastAppliedSeq = -1;
+  resetSyncProgress();
+  if (state) {
+    state = { ...emptyDashboard(state.repositoryId), mode };
+    syncFromDashboard(state);
+  }
+  goView("queue", false);
+  return withRefresh(() => postJSON("api/mode", { mode }));
+};
 const toggleAccountActive = (id, active) => withRefresh(() => postJSON("api/account/toggle", { id, active }));
 
 function captureSettingsDraft() {
@@ -750,6 +1009,7 @@ function captureSettingsDraft() {
   return {
     release: release.value,
     teamMembers: document.getElementById("team-members-input")?.value || "",
+    maxOpenItems: document.getElementById("max-open-items")?.value ?? String(prefs?.maxOpenItems ?? 200),
     showDrafts: showDrafts.checked,
     sessionFields: standalone ? ["session-project-name", "session-project-url", "session-project"]
       .map(id => ({ id, value: document.getElementById(id)?.value || "" })) : [],
@@ -773,6 +1033,8 @@ function restoreSettingsDraft(draft) {
   if (release) release.value = draft.release;
   const teamMembers = document.getElementById("team-members-input");
   if (teamMembers) teamMembers.value = draft.teamMembers;
+  const maxOpenItems = document.getElementById("max-open-items");
+  if (maxOpenItems) maxOpenItems.value = draft.maxOpenItems;
   if (showDrafts) showDrafts.checked = draft.showDrafts;
   if (reviewRequested) reviewRequested.checked = draft.notifications.reviewRequested;
   if (readyToMerge) readyToMerge.checked = draft.notifications.readyToMerge;
@@ -809,6 +1071,7 @@ async function mutateAzurePipeline(path, body, clearDraft) {
       if (typeof seq !== "number" || seq > lastAppliedSeq) {
         state = data.dashboard;
         adoptAppliedRev();
+        syncFromDashboard(state);
       }
     }
     if (clearDraft) {
@@ -979,6 +1242,7 @@ async function commitHealthOrder(nextItems, previousItems, focusId) {
       if (typeof seq !== "number" || seq > lastAppliedSeq) {
         state = data.dashboard;
         adoptAppliedRev();
+        syncFromDashboard(state);
       }
     }
     loadError = null;
@@ -1273,6 +1537,17 @@ function openCbMenu(split, caret, menu) {
 }
 
 async function saveSettings() {
+  const itemLimitInput = document.getElementById("max-open-items");
+  const maxOpenItems = Number(itemLimitInput?.value ?? prefs?.maxOpenItems ?? 200);
+  if (!Number.isInteger(maxOpenItems) || maxOpenItems < 1 || maxOpenItems > 10000) {
+    settingsError = "Open item limit must be a whole number between 1 and 10000.";
+    const error = document.getElementById("settings-error");
+    if (error) error.textContent = settingsError;
+    itemLimitInput?.setAttribute("aria-invalid", "true");
+    itemLimitInput?.focus?.();
+    return;
+  }
+  settingsError = "";
   const release = document.getElementById("release-input").value;
   const teamMembers = document.getElementById("team-members-input")?.value || "";
   const showDrafts = document.getElementById("s-drafts").checked;
@@ -1283,16 +1558,19 @@ async function saveSettings() {
     ciFailing: document.getElementById("n-ci").checked,
   };
   goView("queue", true);
-  await withRefresh(() => postJSON("api/prefs", { release, showDrafts, teamMembers, notifications }));
+  await withRefresh(() => postJSON("api/prefs", { release, showDrafts, teamMembers, notifications, maxOpenItems }));
 }
 
 async function rescanAccounts() {
   const generation = ++accountScanGeneration;
+  if (accountScanController) accountScanController.abort();
+  const controller = new AbortController();
+  accountScanController = controller;
   rescanning = true;
   const btn = document.getElementById("rescan-btn");
   if (btn) btn.classList.add("spin");
   try {
-    const res = await apiFetch("api/accounts");
+    const res = await apiFetch("api/accounts", { signal: controller.signal });
     const data = await readJson(res);
     if (generation !== accountScanGeneration) return;
     if (!Array.isArray(data?.accounts)) throw new Error("Invalid account discovery response.");
@@ -1303,10 +1581,11 @@ async function rescanAccounts() {
       cancelRepositorySearch();
     }
   } catch (e) {
-    if (generation !== accountScanGeneration) return;
+    if (generation !== accountScanGeneration || e.name === "AbortError") return;
     loadError = String((e && e.message) || e);
   } finally {
     if (generation === accountScanGeneration) {
+      accountScanController = null;
       rescanning = false;
       if (view === "accounts" || view === "repositories") render();
     }
@@ -1324,7 +1603,14 @@ const restoreNotifs = () => withRefresh(() => postJSON("api/notifications/restor
 /* ---- navigation ---- */
 
 function goView(next, forward) {
+  if ((view === "accounts" || view === "repositories") && next !== "accounts" && next !== "repositories" && accountScanController) {
+    ++accountScanGeneration;
+    accountScanController.abort();
+    accountScanController = null;
+    rescanning = false;
+  }
   if (view === "repositories" && next !== "repositories") cancelRepositorySearch();
+  if (next === "settings" && view !== "settings") settingsError = "";
   prevRank = RANK[view] || 0;
   view = next;
   // Returning to the queue is the moment to fold in any dashboard that streamed in while
@@ -1883,7 +2169,7 @@ function topbarHtml() {
     "</div>";
   return '<div class="topbar" id="topbar">' +
     '<button class="brand" id="brand-home" type="button" title="Back to review queue"><span class="mark">' + LOGO + '</span><span class="brand-text">GitHub Team App</span></button>' +
-    repositoryPicker() + left + '<span class="spacer"></span>' + right + "</div>";
+    repositoryChip() + left + '<span class="spacer"></span>' + right + "</div>";
 }
 
 /* ---- views ---- */
@@ -2110,7 +2396,7 @@ function healthView() {
 
 function queueView() {
   if (prefs && Object.hasOwn(prefs, "selectedRepository") && !prefs.selectedRepository) {
-    return '<div class="state"><div class="ico">' + ICONS.layers + '</div><h2>Choose a repository</h2><p>Add a repository on the Repositories page, then select it in the header.</p></div>';
+    return '<div class="state"><div class="ico">' + ICONS.layers + '</div><h2>Choose a repository</h2><p>Use the Repositories button to add or select a repository.</p></div>';
   }
   if (state.cacheStatus === "loading") {
     return '<div class="state" role="status"><div class="ico">' + ICONS.refresh +
@@ -2138,7 +2424,8 @@ function queueView() {
     : "";
   return '<div class="subbar">' +
       '<span class="who">' + who + "</span>" +
-      '<span class="meta">' + state.counts.prs + " open PRs in the selected repository" + draftsHidden + "</span>" +
+      '<span class="meta">' + (state.mode === "issues" ? state.counts.issues + " open issues" : state.counts.prs + " open PRs") +
+        " in the loaded repository window" + draftsHidden + "</span>" +
       statsHtml() +
     "</div>" +
     (state.errors && state.errors.length ? '<div class="errbar">' + esc(state.errors.join(" \u00b7 ")) + "</div>" : "") +
@@ -2255,8 +2542,14 @@ function settingsView() {
   const limit = (state.reviewLimit || 10);
   return '<div class="page">' +
     '<div class="page-head"><h2>Settings</h2><p>Tune the review queue, team, delivery health, and notifications. Manage projects on the Repositories page and credentials on the Accounts page.</p></div>' +
+    '<div class="section"><h3>Repository sync</h3><p class="hint" id="item-limit-hint">Load the most recently updated open items first. ' +
+      'This limit applies separately to PRs and issues in the selected repository, before fetching full details, to reduce GitHub API usage. Default: 200. Higher limits use more quota.</p>' +
+      '<div class="field"><label for="max-open-items">Maximum open items</label><input type="number" id="max-open-items" min="1" max="10000" step="1" required ' +
+      'aria-describedby="item-limit-hint settings-error" value="' + esc(prefs.maxOpenItems ?? 200) + '"' +
+      (settingsError ? ' aria-invalid="true"' : "") + ' /></div>' +
+      '<div class="pipeline-err" id="settings-error" role="alert">' + esc(settingsError) + '</div></div>' +
     '<div class="section"><h3>Review queue</h3>' +
-      '<p class="hint">The shared queue is team-managed, not individually sorted. It shows at most <b>' + limit + '</b> PRs, ranked so the oldest waits surface first.</p>' +
+      '<p class="hint">Within the loaded items, the shared queue is team-managed, not individually sorted. It shows at most <b>' + limit + '</b> PRs, ranked so the oldest waits surface first.</p>' +
       '<div class="policy">' +
         '<div class="policy-row">' + ICONS.eye + '<span>A PR only enters the shared queue once <b>checks are green</b> and <b>all review feedback is resolved</b>. Unfinished work stays in the author\u2019s <b>Your PRs</b> lane.</span></div>' +
         '<div class="policy-row">' + ICONS.pr + '<span>Draft PRs are hidden by default. They are prototypes and experiments, not review work.</span></div>' +
@@ -2497,16 +2790,18 @@ function render(forward) {
   // open menu never survives a re-render as a detached orphan carrying stale click handlers.
   document.querySelectorAll("body > .cb-menu").forEach((m) => m.remove());
   if (loadError && !state && view === "queue") {
-    app.innerHTML = topbarShell() +
+    app.innerHTML = topbarShell() + syncProgressHtml() +
       '<div class="state"><div class="ico">' + ICONS.alert + '</div><h2>Could not load</h2><p>' + esc(loadError) +
       '</p><div class="state-cta"><button class="btn" id="retry-btn">Try again</button></div></div>';
     const rt = document.getElementById("retry-btn"); if (rt) rt.addEventListener("click", load);
     wire();
+    renderSyncProgress();
     return;
   }
   if (!state && view !== "repositories" && view !== "accounts") {
-    app.innerHTML = topbarHtml() + '<div class="state" role="status">Loading...</div>';
+    app.innerHTML = topbarHtml() + syncProgressHtml() + '<div class="state" role="status">Loading...</div>';
     wire();
+    renderSyncProgress();
     return;
   }
 
@@ -2540,7 +2835,13 @@ function render(forward) {
       (!noRepository && state.fetchedAt && ["cached", "live"].includes(state.cacheStatus) ? " &middot; Updated " + esc(timeAgo(state.fetchedAt)) : "") +
       (!noRepository && state.refreshing ? " &middot; Refreshing..." : "") + '</div>' +
       (state.refreshError ? '<div class="errbar" role="alert">Refresh failed: ' + esc(state.refreshError) + '</div>' : "") : "";
-  app.innerHTML = topbarHtml() + banner + freshness + '<div class="viewport"><div class="view ' + dir + motionClass + '">' + inner + "</div></div>";
+  const itemScope = state?.itemScope;
+  const limitNotice = view === "queue" && state?.mode !== "health" && itemScope?.limited
+    ? '<div class="item-limit-notice" role="note"><span>Loaded ' + esc(itemScope.loaded) + " of " + esc(itemScope.totalOpen) +
+      " open " + (state.mode === "issues" ? "issues" : "PRs") + ", most recently updated first. Limit: " + esc(itemScope.limit) +
+      '. Counts and lanes use this limited set.</span><button class="linklike" id="item-limit-settings" type="button">Change limit</button></div>' : "";
+  app.innerHTML = topbarHtml() + banner + syncProgressHtml() + freshness + limitNotice + '<div class="viewport"><div class="view ' + dir + motionClass + '">' + inner + "</div></div>";
+  renderSyncProgress();
   if (banner) {
     const bx = document.getElementById("load-errbar-dismiss");
     if (bx) bx.addEventListener("click", function () { loadError = null; render(); });
@@ -2652,6 +2953,15 @@ function wire() {
   const acct = document.getElementById("acct-btn"); if (acct) acct.addEventListener("click", () => goView(view === "accounts" ? "queue" : "accounts"));
 
   const save = document.getElementById("save-settings"); if (save) save.addEventListener("click", saveSettings);
+  const itemLimitSettings = document.getElementById("item-limit-settings");
+  if (itemLimitSettings) itemLimitSettings.addEventListener("click", () => goView("settings"));
+  const itemLimitInput = document.getElementById("max-open-items");
+  if (itemLimitInput) itemLimitInput.addEventListener("input", () => {
+    settingsError = "";
+    itemLimitInput.removeAttribute("aria-invalid");
+    const error = document.getElementById("settings-error");
+    if (error) error.textContent = "";
+  });
   const cancel = document.getElementById("cancel-settings"); if (cancel) cancel.addEventListener("click", () => goView("queue", false));
   const fToSettings = document.getElementById("filters-to-settings"); if (fToSettings) fToSettings.addEventListener("click", () => goView("settings"));
   const pipelineUrl = document.getElementById("pipeline-url-input");
@@ -2816,13 +3126,10 @@ function wireAccounts() {
 try {
   const es = new EventSource(standalone ? "events?client=" + dashboardClient : "events");
   if (standalone) es.addEventListener("refresh-error", (e) => {
-    const data = JSON.parse(e.data);
-    if (prefs && Object.hasOwn(prefs, "selectedRepository") && data.repositoryId !== prefs.selectedRepository) return;
-    loadError = data.error;
-    if (view === "queue") render();
+    try { onRefreshError(JSON.parse(e.data)); } catch (error) { console.error("Invalid sync error event", error); }
   });
   es.addEventListener("progress", (e) => {
-    try { const p = JSON.parse(e.data); setProgress(p.done, p.total); } catch {}
+    try { onProgress(JSON.parse(e.data)); } catch (error) { console.error("Invalid sync progress event", error); }
   });
   es.addEventListener("state", (e) => {
     try { applyPushedState(JSON.parse(e.data)); } catch {}

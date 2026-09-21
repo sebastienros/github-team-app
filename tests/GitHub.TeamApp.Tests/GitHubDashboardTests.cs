@@ -86,13 +86,15 @@ public class GitHubDashboardTests
             page["endCursor"] = failure == "missing" ? null : failure == "limit" ? $"page-{count}" : "cursor-1";
             return JsonResponse(response);
         });
-        var result = await Dashboard(http).LoadAsync([Account()], Prefs("ship"), TestContext.Current.CancellationToken);
+        var prefs = Prefs("ship");
+        prefs["maxOpenItems"] = 10000;
+        var result = await Dashboard(http).LoadAsync([Account()], prefs, TestContext.Current.CancellationToken);
 
-        Assert.Equal(failure switch { "missing" => 1, "limit" => 25, "failure" => 1, _ => 2 }, result["counts"].Number("total"));
+        Assert.Equal(failure switch { "missing" => 1, "limit" => GitHubDashboard.MaxPages, "failure" => 1, _ => 2 }, result["counts"].Number("total"));
         var error = Assert.Single(result["errors"].Strings());
         Assert.Equal("microsoft/aspire (github.com): " + (failure switch
         {
-            "limit" => "Reached the 25-page safety limit; the queue is incomplete.",
+            "limit" => $"Reached the {GitHubDashboard.MaxPages}-page safety limit; the queue is incomplete.",
             "failure" => "GitHub API 503 Service Unavailable: service unavailable",
             _ => "GitHub returned a missing or repeated pagination cursor; the queue is incomplete."
         }), error);

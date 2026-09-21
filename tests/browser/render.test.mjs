@@ -17,8 +17,8 @@ test("renderer uses Clawpilot theme variables and CSP-safe external scripts", ()
   assert.doesNotMatch(HTML + APP_JS, /<script>|style=|onerror=|Aspire|aspireTeamStandalone/);
   assert.match(HTML, /GitHub Team App/);
   assert.match(APP_JS, /window.githubTeamStandalone/);
-  // Deterministic load bar replaced the looping indeterminate one (no glow, no paintfill).
-  assert.match(STYLES, /\.loadbar \{[\s\S]*?transition: width/);
+  // Known counts update directly; only opacity animates on the fixed top bar.
+  assert.match(STYLES, /\.loadbar \{[\s\S]*?transition: opacity/);
   assert.doesNotMatch(STYLES, /animation: paintfill/);
   assert.doesNotMatch(STYLES, /box-shadow: 0 0 8px/);
   assert.doesNotMatch(STYLES, /var\(--n-/);
@@ -528,7 +528,10 @@ test("setProgress doesn't fade the bar from a terminal SSE tick while another re
   const cls = new Set();
   const loadbar = {
     style: { width: "" },
-    classList: { add: (c) => cls.add(c), remove: (c) => cls.delete(c), contains: (c) => cls.has(c) },
+    classList: {
+      add: (c) => cls.add(c), remove: (c) => cls.delete(c), contains: (c) => cls.has(c),
+      toggle: (c, on) => on ? cls.add(c) : cls.delete(c),
+    },
   };
   const { api } = createRendererHarness({ loadbar });
   cls.clear();
@@ -1361,14 +1364,15 @@ function formElement(value = "", checked = false) {
   return { value, checked, addEventListener() {}, classList: classList(), setAttribute() {} };
 }
 
-test("project picker and repository management remain available before load, unauthenticated, and after failure", () => {
+test("single repository button remains available before load, unauthenticated, and after failure", () => {
   const { app, api } = createRendererHarness({ fetch: () => new Promise(() => {}) });
   for (const state of [null, { authenticated: false, accounts: [], message: "" }]) {
     api.setState(state);
     api.render();
-    assert.match(app.innerHTML, /id="repository-picker"/);
-    assert.match(app.innerHTML, /id="repositories-btn"/);
-    assert.match(app.innerHTML, /No repository selected/);
+    assert.doesNotMatch(app.innerHTML, /repository-picker|project-picker/);
+    assert.equal((app.innerHTML.match(/id="repositories-btn"/g) || []).length, 1);
+    assert.match(app.innerHTML, /class="acct-chip repo-chip [^"]*" id="repositories-btn"/);
+    assert.match(app.innerHTML, /<span class="name">Repositories<\/span>/);
   }
   api.setState(null);
   api.setLoadError("Offline");
@@ -1389,52 +1393,74 @@ test("accounts no longer edit repositories, and the repositories page preserves 
   assert.doesNotMatch(APP_JS, /api\/account\/repos/);
   api.setView("repositories");
   api.render();
-  assert.match(app.innerHTML, /value="ghe.example.com\/team\/beta"/);
-  assert.match(app.innerHTML, /Team\/Beta \(ghe.example.com\)/);
+  assert.match(app.innerHTML, /data-repository-select="ghe.example.com\/team\/beta"/);
+  assert.match(app.innerHTML, /<b>Team\/Beta<\/b><p>ghe.example.com/);
   assert.match(app.innerHTML, /acct:ghe.example.com\/octo/);
   assert.match(app.innerHTML, /data-repository-remove="github.com\/octo\/alpha"/);
   assert.match(app.innerHTML, /<select id="repository-account">/);
   assert.doesNotMatch(app.innerHTML, /<input[^>]*(?:id|name)="[^"]*host/i);
 });
 
-test("empty selection cannot clear the picker or contradict an existing repository dashboard", async () => {
+test("empty selection cannot clear the repository button or contradict its dashboard", async () => {
   const requests = [];
-  const handlers = {};
-  const picker = {
-    ...formElement(repositoryA.id),
-    addEventListener(event, handler) { handlers[event] = handler; },
-  };
   const { app, api } = createRendererHarness({
-    elements: { "repository-picker": picker },
     fetch: path => { requests.push(path); return new Promise(() => {}); },
   });
   seedRepository(api);
   api.render();
-  assert.match(app.innerHTML, /<option value="" disabled>No repository selected<\/option>/);
+  assert.match(app.innerHTML, /<span class="name">Octo\/Alpha<\/span>/);
   const dashboard = api.getState();
   const preferences = api.getPrefs();
-  picker.value = "";
-  await handlers.change();
-  assert.equal(picker.value, repositoryA.id);
+  await api.selectRepository("");
   assert.equal(api.getState(), dashboard);
   assert.equal(api.getPrefs(), preferences);
-  assert.match(app.innerHTML, /value="github.com\/octo\/alpha" selected/);
+  assert.match(app.innerHTML, /<span class="name">Octo\/Alpha<\/span>/);
   assert.match(app.innerHTML, /Choose a repository from the list/);
   assert.ok(!requests.includes("api/repositories/select"));
 });
 
-test("empty startup keeps its placeholder selected without posting an empty selection", async () => {
+test("empty startup labels its button Repositories without posting an empty selection", async () => {
   const requests = [];
   const { app, api } = createRendererHarness({
     fetch: path => { requests.push(path); return new Promise(() => {}); },
   });
   seedRepository(api, null);
   api.render();
-  assert.match(app.innerHTML, /<option value="" selected>No repository selected<\/option>/);
+  assert.match(app.innerHTML, /<span class="name">Repositories<\/span>/);
   await api.selectRepository("");
   assert.equal(api.getPrefs().selectedRepository, "");
   assert.equal(api.getLoadError(), null);
   assert.ok(!requests.includes("api/repositories/select"));
+});
+
+test("repository chip opens management, selecting opens the dashboard, and the named chip reopens management", async () => {
+  const handlers = {};
+  const selected = deferred();
+  const chip = { addEventListener(event, handler) { handlers.chip = handler; } };
+  const row = { dataset: { repositorySelect: repositoryB.id }, addEventListener(event, handler) { handlers.select = handler; } };
+  const { app, api } = createRendererHarness({
+    elements: { "repositories-btn": chip },
+    querySelectorAll: selector => selector === "[data-repository-select]" ? [row] : [],
+    fetch: path => path === "api/repositories/select" ? selected.promise : new Promise(() => {}),
+  });
+  seedRepository(api);
+  api.render();
+  handlers.chip();
+  assert.match(app.innerHTML, /<h2>Repositories<\/h2>/);
+  assert.match(app.innerHTML, /id="repositories-btn"[^>]*aria-expanded="true"/);
+  const selecting = handlers.select();
+  assert.doesNotMatch(app.innerHTML, /<h2>Repositories<\/h2>/);
+  assert.match(app.innerHTML, /Loading repository/);
+  assert.match(app.innerHTML, /<span class="name">Team\/Beta<\/span>/);
+  assert.match(app.innerHTML, /Team\/Beta \(ghe.example.com\) - Select and manage repositories/);
+  selected.resolve(jsonResponse(repositoryPayload(repositoryB, 2)));
+  await selecting;
+  assert.match(app.innerHTML, /Cached data/);
+  handlers.chip();
+  assert.match(app.innerHTML, /<h2>Repositories<\/h2>/);
+  assert.match(app.innerHTML, /data-repository-select="ghe.example.com\/team\/beta">Open selected/);
+  handlers.chip();
+  assert.doesNotMatch(app.innerHTML, /<h2>Repositories<\/h2>/);
 });
 
 test("repository switching clears old content immediately, applies cache, then accepts only matching SSE", async () => {
@@ -1456,6 +1482,50 @@ test("repository switching clears old content immediately, applies cache, then a
   api.applyPushedState(repositoryPayload(repositoryB, 3, { cacheStatus: "live", refreshing: false }));
   assert.match(app.innerHTML, /Live data/);
   assert.doesNotMatch(app.innerHTML, /Refreshing\.\.\./);
+});
+
+test("opening the current repository returns to its cached dashboard without starting another sync", async () => {
+  const requests = [];
+  const { app, api } = createRendererHarness({
+    fetch: path => { requests.push(path); return new Promise(() => {}); },
+  });
+  seedRepository(api);
+  const dashboard = api.getState();
+  api.setView("repositories");
+  await api.selectRepository(repositoryA.id);
+  assert.equal(api.getState(), dashboard);
+  assert.match(app.innerHTML, /Cached data/);
+  assert.doesNotMatch(app.innerHTML, /<h2>Repositories<\/h2>/);
+  assert.ok(!requests.includes("api/repositories/select"));
+});
+
+test("leaving repository management cancels credential discovery before selecting and ignores its late error", async () => {
+  const discovery = deferred();
+  let signal;
+  let calls = 0;
+  const { api } = createRendererHarness({
+    fetch: (path, options) => {
+      if (path === "api/accounts") {
+        signal = options.signal;
+        calls++;
+        return calls === 1 ? discovery.promise : new Promise(() => {});
+      }
+      if (path === "api/repositories/select") return Promise.resolve(jsonResponse(repositoryPayload(repositoryB, 2)));
+      return new Promise(() => {});
+    },
+  });
+  seedRepository(api);
+  api.setView("repositories");
+  const scanning = api.rescanAccounts();
+  assert.equal(signal.aborted, false);
+  await api.selectRepository(repositoryB.id);
+  assert.equal(signal.aborted, true);
+  discovery.reject(new Error("Repository configuration changed during discovery"));
+  await scanning;
+  assert.equal(api.getLoadError(), null);
+  assert.equal(api.getState().repositoryId, repositoryB.id);
+  api.goView("repositories");
+  assert.equal(calls, 2);
 });
 
 test("A then B selection serializes server writes and ignores late A responses and errors", async () => {
@@ -1667,10 +1737,11 @@ test("repository add/remove use their dedicated API contracts and preserve state
   assert.equal(api.getState().repositoryId, "");
 });
 
-test("settings send an empty release and configurable team text and preserve both across auxiliary forms", async () => {
+test("settings send the open-item limit, release and team text and preserve drafts across auxiliary forms", async () => {
   const elements = {
     "release-input": formElement(""),
     "team-members-input": formElement("octo\nhubot"),
+    "max-open-items": formElement("350"),
     "s-drafts": formElement("", true),
     "n-review": formElement("", true), "n-ready": formElement(), "n-changes": formElement(), "n-ci": formElement(),
   };
@@ -1686,14 +1757,68 @@ test("settings send an empty release and configurable team text and preserve bot
   seedRepository(api);
   const draft = api.captureSettingsDraft();
   elements["team-members-input"].value = "discarded";
+  elements["max-open-items"].value = "200";
   api.restoreSettingsDraft(draft);
   assert.equal(elements["team-members-input"].value, "octo\nhubot");
+  assert.equal(elements["max-open-items"].value, "350");
   assert.match(api.settingsView(), /Leave empty for no release filter/);
   assert.doesNotMatch(api.settingsView(), /13\.5|microsoft\/aspire/);
   await api.saveSettings();
   assert.equal(body.release, "");
   assert.equal(body.teamMembers, "octo\nhubot");
   assert.equal(body.showDrafts, true);
+  assert.equal(body.maxOpenItems, 350);
+});
+
+test("open-item settings default to 200 and explain newest-first API limits", () => {
+  const { api } = createRendererHarness();
+  seedRepository(api);
+  assert.match(api.settingsView(), /id="max-open-items"[^>]*min="1"[^>]*max="10000"[^>]*value="200"/);
+  assert.match(api.settingsView(), /most recently updated open items first/);
+  assert.match(api.settingsView(), /before fetching full details/);
+  api.setPrefs({ ...api.getPrefs(), maxOpenItems: 75 });
+  assert.match(api.settingsView(), /id="max-open-items"[^>]*value="75"/);
+});
+
+test("invalid open-item limits leave Settings and its draft intact without a request", async () => {
+  for (const value of ["", "0", "-1", "1.5", "10001", "NaN"]) {
+    let focused = false;
+    const error = { textContent: "" };
+    const limit = { ...formElement(value), focus() { focused = true; } };
+    const requests = [];
+    const { app, api } = createRendererHarness({
+      elements: { "max-open-items": limit, "settings-error": error },
+      fetch: path => { requests.push(path); return new Promise(() => {}); },
+    });
+    seedRepository(api);
+    api.setView("settings");
+    api.render();
+    await api.saveSettings();
+    assert.match(app.innerHTML, /<h2>Settings<\/h2>/);
+    assert.match(error.textContent, /whole number between 1 and 10000/);
+    assert.equal(limit.value, value);
+    assert.equal(focused, true);
+    assert.ok(!requests.includes("api/prefs"));
+  }
+});
+
+test("limited repository windows show their scope and link to Settings without warning on Health", () => {
+  const handlers = {};
+  const { app, api } = createRendererHarness({
+    elements: { "item-limit-settings": { addEventListener(event, handler) { handlers.settings = handler; } } },
+  });
+  seedRepository(api);
+  api.setState({ ...api.getState(), mode: "issues", itemScope: { limit: 200, loaded: 200, totalOpen: 9500, limited: true } });
+  api.render();
+  assert.match(app.innerHTML, /Loaded 200 of 9500 open issues, most recently updated first. Limit: 200/);
+  assert.match(app.innerHTML, /Counts and lanes use this limited set/);
+  handlers.settings();
+  assert.match(app.innerHTML, /<h2>Settings<\/h2>/);
+  assert.doesNotMatch(app.innerHTML, /Loaded 200 of 9500/);
+  api.setView("queue");
+  api.setState({ ...api.getState(), mode: "health" });
+  api.render();
+  assert.doesNotMatch(app.innerHTML, /Loaded 200 of 9500/);
 });
 
 test("standalone doctor and session configuration retain their endpoints and generic defaults", async () => {
@@ -1810,7 +1935,8 @@ test("all dashboard modes preserve the same selected repository and header manag
     api.setState(data.dashboard);
     api.setPrefs(data.prefs);
     api.render();
-    assert.match(app.innerHTML, /value="ghe.example.com\/team\/beta" selected/);
+    assert.match(app.innerHTML, /<span class="name">Team\/Beta<\/span>/);
+    assert.doesNotMatch(app.innerHTML, /repository-picker/);
     assert.match(app.innerHTML, /id="repositories-btn"/);
     assert.equal(api.getState().repositoryId, repositoryB.id);
   }
@@ -1897,7 +2023,7 @@ function createRendererHarness(overrides = {}) {
     window: { CSS: { escape: cssEscape }, githubTeamStandalone: !!overrides.standalone },
     crypto: { randomUUID: () => "b3a61b14-b22c-426e-9a4b-495606e2bc3a" },
     CSS: { escape: cssEscape },
-    EventSource: function () { throw new Error("disabled"); },
+    EventSource: overrides.EventSource ?? function () { throw new Error("disabled"); },
     ResizeObserver: undefined,
     requestAnimationFrame(handler) { handler(); },
     fetch: overrides.fetch ?? (async () => jsonResponse({ dashboard: null, prefs: null })),
@@ -1912,6 +2038,11 @@ function createRendererHarness(overrides = {}) {
 
   vm.runInNewContext(`${APP_JS}\n;globalThis.__test = {\n  render,\n  withRefresh,\n  load,\n  rescanAccounts,\n  onCardAction,\n  applyPushedState,\n  onUpdateAvailable,\n  onPreferences,\n  onSnapshot,\n  onPollSchedule,\n  applyAvailableUpdate,\n  toggleAutoApply,\n  autoApplyEnabled,\n  openLinkedPr,\n  selectRepository,\n  mutateRepository,\n  scheduleRepositorySearch,\n  searchRepositories,\n  repositoriesView,\n  currentAccounts,\n  goView,\n  saveSettings,\n  runDoctor,\n  saveSessionProject,\n  settingsView,\n  captureSettingsDraft,\n  restoreSettingsDraft,\n  forYouCardActions,\n  focusCardActions,\n  laneCardActions,\n  signalActions,\n  mergeActions,\n  queuePanel,\n  cardActionBtn,\n  issueCard,\n  healthCard,\n  healthView,\n  healthRepositoryGroups,\n  pipelineEditorHtml,\n  addAzurePipeline,\n  removeAzurePipeline,\n  commitHealthOrder,\n  moveHealthSource,\n  dropHealthSource,\n  setHealthDropMarker,\n  wireHealthOrdering,\n  actionKey,\n  inflightActions,\n  setProgress,\n  setState(value) { state = value; },\n  getState() { return state; },\n  getAppliedSeq() { return lastAppliedSeq; },\n  getUpdateAvailable() { return updateAvailable; },\n  setPrefs(value) { prefs = value; },\n  getPrefs() { return prefs; },\n  setHealthOrderSaving(value) { healthOrderSaving = !!value; },\n  setPipelineDrafts(url, branch) { pipelineUrlDraft = url; pipelineBranchDraft = branch; },\n  getPipelineDrafts() { return { url: pipelineUrlDraft, branch: pipelineBranchDraft, error: pipelineError }; },\n  setView(value) { view = value; },\n  setRefreshing(value) { refreshing = !!value; },\n  setRefreshInFlight(value) { refreshInFlight = value; },\n  setLoadError(value) { loadError = value; },\n  getLoadError() { return loadError; },\n};`, sandbox);
 
+  vm.runInNewContext(`Object.assign(__test, {
+    onProgress, setMode, renderSyncProgress,
+    getProgress() { return syncProgress; },
+    isSyncActive() { return syncActive; }
+  });`, sandbox);
   return { app, api: sandbox.__test };
 }
 
@@ -1990,12 +2121,553 @@ function errorElement() {
 function classList() {
   const classes = new Set();
   return {
-    add(name) { classes.add(name); },
-    remove(name) { classes.delete(name); },
+    add(...names) { names.forEach(name => classes.add(name)); },
+    remove(...names) { names.forEach(name => classes.delete(name)); },
     toggle(name, on) { if (on) classes.add(name); else classes.delete(name); },
     contains(name) { return classes.has(name); },
   };
 }
+
+function progressElement() {
+  const attributes = new Map();
+  return {
+    hidden: false, textContent: "", style: { width: "" }, classList: classList(),
+    setAttribute(name, value) { attributes.set(name, String(value)); },
+    removeAttribute(name) { attributes.delete(name); },
+    getAttribute(name) { return attributes.get(name) ?? null; },
+    set value(value) { attributes.set("value", String(value)); },
+    get value() { return Number(attributes.get("value")); },
+    set max(value) { attributes.set("max", String(value)); },
+  };
+}
+
+function syncHarness(options = {}) {
+  const events = {};
+  const section = progressElement();
+  const status = progressElement();
+  const bar = progressElement();
+  const detail = progressElement();
+  const loadbar = progressElement();
+  const elements = {
+    "sync-progress": section, "sync-progress-status": status,
+    "sync-progress-bar": bar, "sync-progress-detail": detail,
+    "release-input": formElement("unsaved release"),
+  };
+  const harness = createRendererHarness({
+    standalone: true, fetch: () => new Promise(() => {}), ...options,
+    loadbar, elements,
+    EventSource: function () {
+      this.addEventListener = (name, handler) => { events[name] = handler; };
+    },
+  });
+  return {
+    ...harness, section, status, bar, detail, loadbar, elements,
+    emit(name, data) { assert.ok(events[name], name); events[name]({ data: JSON.stringify(data) }); },
+  };
+}
+
+function syncTick(overrides = {}) {
+  return {
+    repositoryId: repositoryA.id, mode: "health", syncId: "sync-1", revision: 1,
+    phase: "initial-items", done: 100, total: 42000, unit: "items", initial: true,
+    complete: false, ...overrides,
+  };
+}
+
+test("first sync uses provider counts and indeterminate totals, never a fabricated starter percentage", () => {
+  const h = syncHarness();
+  seedRepository(h.api);
+  h.emit("progress", syncTick({ phase: "authenticating", total: null, done: 0 }));
+  assert.equal(h.section.hidden, false);
+  assert.equal(h.section.classList.contains("initial"), true);
+  assert.equal(h.bar.getAttribute("aria-busy"), "true");
+  assert.match(h.status.textContent, /Initial sync: Checking GitHub credentials/);
+  assert.equal(h.bar.getAttribute("value"), null);
+  assert.equal(h.bar.getAttribute("aria-valuenow"), null);
+  assert.equal(h.loadbar.classList.contains("indeterminate"), true);
+
+  h.emit("progress", syncTick({ revision: 2, done: 300 }));
+  assert.match(h.status.textContent, /300 of 42000 items/);
+  assert.equal(h.bar.getAttribute("aria-valuenow"), "300");
+  assert.equal(h.bar.getAttribute("aria-valuemax"), "42000");
+  assert.equal(h.loadbar.style.width, (300 / 42000 * 100) + "%");
+  assert.equal(h.loadbar.classList.contains("indeterminate"), false);
+
+  h.emit("progress", syncTick({ revision: 3, done: 400, total: 45000 }));
+  assert.match(h.status.textContent, /400 of 45000 items/);
+  assert.equal(h.bar.getAttribute("aria-valuemax"), "45000");
+  h.emit("progress", syncTick({ revision: 4, done: 45000, total: 45000 }));
+  assert.equal(h.api.isSyncActive(), true);
+  assert.equal(h.bar.getAttribute("value"), null, "a finished fetch phase is not a finished sync");
+  assert.equal(h.loadbar.classList.contains("active"), true);
+  assert.equal(h.loadbar.classList.contains("indeterminate"), true);
+  h.emit("progress", syncTick({ revision: 5, phase: "saving", done: 0, total: null }));
+  assert.match(h.status.textContent, /Saving repository data/);
+  assert.equal(h.bar.getAttribute("aria-valuenow"), null);
+});
+
+test("empty and growing phase totals remain honest and metadata is inserted only as text", () => {
+  const h = syncHarness();
+  seedRepository(h.api);
+  h.api.render();
+  const html = h.app.innerHTML;
+  h.emit("progress", syncTick({ total: 0, done: 0, unit: "PRs" }));
+  assert.match(h.status.textContent, /0 of 0 PRs/);
+  assert.equal(h.bar.getAttribute("value"), null);
+  h.emit("progress", syncTick({ revision: 2, phase: "<img src=x>", unit: "<svg/onload=alert(1)>", total: 200 }));
+  assert.match(h.status.textContent, /<img src=x> - 100 of 200 <svg\/onload=alert\(1\)>/);
+  assert.equal(h.app.innerHTML, html, "metadata never enters HTML or causes a dashboard render");
+  h.emit("progress", syncTick({ revision: 3, phase: "future-provider-phase", total: null, done: 200 }));
+  assert.match(h.status.textContent, /future provider phase - 200 items fetched/);
+  h.emit("progress", syncTick({ revision: 4, phase: "live-state", unit: "PRs", total: 1000 }));
+  assert.match(h.status.textContent, /Checking live pull request state - 100 of 1000 PRs/);
+});
+
+test("loading GET and immediate refresh POST keep sync visible until the server completes", async () => {
+  const firstGet = deferred();
+  const loading = repositoryPayload(repositoryA, 1, {
+    cacheStatus: "loading", loading: true, syncProgress: syncTick({ total: null, done: 0 }),
+  });
+  const h = syncHarness({ fetch: () => firstGet.promise });
+  firstGet.resolve(jsonResponse(loading));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.api.isSyncActive(), true);
+  assert.equal(h.loadbar.classList.contains("active"), true);
+  assert.equal(h.section.classList.contains("initial"), true);
+  assert.match(h.app.innerHTML, /Loading repository/);
+
+  await h.api.withRefresh(async () => repositoryPayload(repositoryA, 2, {
+    cacheStatus: "loading", loading: true, syncProgress: syncTick({ revision: 2 }),
+  }));
+  assert.equal(h.loadbar.classList.contains("active"), true, "POST acknowledgement must not end sync");
+  assert.equal(h.api.isSyncActive(), true);
+  h.emit("progress", syncTick({ revision: 3, complete: true, phase: "complete", done: 42000 }));
+  assert.equal(h.api.isSyncActive(), false);
+  assert.equal(h.loadbar.classList.contains("active"), false);
+  assert.equal(h.bar.hidden, true);
+  assert.equal(h.bar.getAttribute("aria-busy"), "false");
+  assert.match(h.status.textContent, /Sync complete/);
+  h.emit("state", repositoryPayload(repositoryA, 3, {
+    refreshing: false, loading: false, cacheStatus: "live",
+    syncProgress: syncTick({ revision: 3, complete: true, phase: "complete", done: 42000 }),
+  }));
+  assert.doesNotMatch(h.app.innerHTML, /Loading repository/);
+});
+
+test("cached background progress and terminal snapshots preserve the form and unsaved edits", () => {
+  const h = syncHarness();
+  seedRepository(h.api);
+  h.api.setView("settings");
+  h.api.render();
+  const html = h.app.innerHTML;
+  const draft = h.elements["release-input"];
+  h.emit("progress", syncTick({ initial: false, phase: "changes" }));
+  assert.equal(h.section.classList.contains("initial"), false);
+  assert.equal(h.app.innerHTML, html);
+  assert.equal(draft.value, "unsaved release");
+  h.emit("state", repositoryPayload(repositoryA, 8, { refreshing: false, loading: false }));
+  assert.equal(h.api.isSyncActive(), false);
+  assert.equal(h.loadbar.classList.contains("active"), false);
+  assert.equal(h.app.innerHTML, html, "terminal state stays pending behind the form");
+  assert.equal(h.elements["release-input"], draft, "focused field identity survives paging and completion");
+  h.emit("progress", syncTick({ revision: 50 }));
+  assert.equal(h.api.isSyncActive(), false, "completed sync IDs cannot be revived");
+});
+
+test("sync errors retain cached content and stop progress without displaying a successful fill", () => {
+  const h = syncHarness();
+  seedRepository(h.api);
+  h.api.render();
+  const html = h.app.innerHTML;
+  h.emit("progress", syncTick({ initial: false }));
+  h.emit("progress", syncTick({ revision: 2, phase: "error", complete: true }));
+  assert.equal(h.api.getState().marker, repositoryA.repository);
+  assert.equal(h.api.isSyncActive(), false);
+  assert.equal(h.loadbar.style.width, "0");
+  assert.equal(h.section.classList.contains("failed"), true);
+  assert.match(h.detail.textContent, /Sync failed/);
+  assert.equal(h.app.innerHTML, html);
+  h.emit("refresh-error", {
+    repositoryId: repositoryA.id, mode: "health", syncId: "sync-1",
+    syncProgress: syncTick({ revision: 2, phase: "error", complete: true }), error: "Provider unavailable",
+  });
+  assert.equal(h.detail.textContent, "Provider unavailable");
+  assert.equal(h.api.getState().marker, repositoryA.repository);
+});
+
+test("progress rejects foreign scopes, out-of-order revisions, superseded sync IDs and stale errors", () => {
+  const h = syncHarness();
+  seedRepository(h.api);
+  h.emit("progress", syncTick({ revision: 10 }));
+  h.emit("progress", syncTick({ revision: 20, syncId: "sync-2", done: 500 }));
+  const accepted = h.status.textContent;
+  for (const tick of [
+    syncTick({ revision: 21, repositoryId: repositoryB.id }),
+    syncTick({ revision: 21, mode: "review" }),
+    syncTick({ revision: 19, syncId: "sync-2", done: 600 }),
+    syncTick({ revision: 20, syncId: "sync-2", done: 600 }),
+    syncTick({ revision: 30, done: 600 }),
+  ]) h.emit("progress", tick);
+  h.emit("refresh-error", { repositoryId: repositoryA.id, mode: "health", syncId: "sync-1", error: "Old failure" });
+  h.emit("refresh-error", { repositoryId: repositoryB.id, mode: "health", error: "Foreign failure" });
+  h.emit("refresh-error", {
+    repositoryId: repositoryA.id, mode: "health", error: "Old job finishing late",
+    syncProgress: syncTick({ revision: 100, phase: "error", complete: true }),
+  });
+  assert.equal(h.status.textContent, accepted);
+  assert.equal(h.api.getLoadError(), null);
+  assert.equal(h.api.isSyncActive(), true);
+});
+
+test("terminal notifications reject wrong modes and attempts while retaining legacy metadata compatibility", () => {
+  const h = syncHarness();
+  seedRepository(h.api);
+  h.emit("progress", syncTick({ syncId: "current-attempt", revision: 20 }));
+  for (const scope of [
+    { mode: "review", syncId: "current-attempt" },
+    { mode: "health", syncId: "older-attempt" },
+  ]) {
+    const notification = { repositoryId: repositoryA.id, seq: 50, error: "Stale failure", ...scope };
+    h.emit("refresh-error", notification);
+    h.emit("update-available", notification);
+    assert.equal(h.api.getLoadError(), null);
+    assert.equal(h.api.getUpdateAvailable(), null);
+    assert.equal(h.api.isSyncActive(), true);
+  }
+  h.emit("update-available", {
+    repositoryId: repositoryA.id, mode: "health", syncId: "current-attempt", seq: 51,
+  });
+  assert.equal(h.api.getUpdateAvailable().seq, 51);
+  h.emit("update-available", { repositoryId: repositoryA.id, seq: 52 });
+  assert.equal(h.api.getUpdateAvailable().seq, 52, "legacy missing mode and attempt fields remain supported");
+  h.emit("refresh-error", {
+    repositoryId: repositoryA.id, mode: "health", syncId: "current-attempt", error: "Current failure",
+  });
+  assert.equal(h.api.isSyncActive(), false);
+  assert.equal(h.detail.textContent, "Current failure");
+});
+
+test("a cold SSE snapshot establishes scope before progress and a reconnect restores progress after restart", () => {
+  const h = syncHarness();
+  h.emit("progress", syncTick({ repositoryId: repositoryB.id, revision: 100 }));
+  h.emit("state", repositoryPayload(repositoryB, 100));
+  h.emit("preferences", repositoryPayload(repositoryB).prefs);
+  assert.equal(h.api.getProgress(), null);
+  assert.equal(h.api.getState(), null);
+  assert.equal(h.api.getPrefs(), null);
+  const payload = repositoryPayload(repositoryA, 10, {
+    cacheStatus: "loading", loading: true, syncProgress: syncTick({ revision: 100 }),
+  });
+  h.emit("snapshot", payload);
+  assert.equal(h.api.getPrefs().selectedRepository, repositoryA.id);
+  assert.equal(h.api.getProgress().revision, 100);
+  h.emit("progress", syncTick({ revision: 101, done: 500 }));
+  h.emit("snapshot", repositoryPayload(repositoryA, 1, {
+    cacheStatus: "loading", loading: true,
+    syncProgress: syncTick({ syncId: "restarted-sync", revision: 1, done: 0, total: null }),
+  }));
+  assert.equal(h.api.getAppliedSeq(), 1);
+  assert.equal(h.api.getProgress().syncId, "restarted-sync");
+  assert.equal(h.api.isSyncActive(), true);
+  h.emit("progress", syncTick({ syncId: "restarted-sync", revision: 2, done: 200 }));
+  assert.match(h.status.textContent, /200 of 42000/);
+  h.emit("progress", syncTick({ revision: 102 }));
+  assert.equal(h.api.getProgress().syncId, "restarted-sync", "late events from the pre-restart sync stay retired");
+});
+
+test("metadata reconnect restores phase progress without replacing a settings form", () => {
+  const h = syncHarness();
+  seedRepository(h.api);
+  h.api.setView("settings");
+  h.api.render();
+  const html = h.app.innerHTML;
+  h.emit("snapshot", {
+    repositoryId: repositoryA.id, mode: "health", seq: 8,
+    prefs: { ...h.api.getPrefs(), autoApplyUpdates: false },
+    syncProgress: syncTick({ revision: 40, done: 900 }),
+  });
+  assert.match(h.status.textContent, /900 of 42000 items/);
+  assert.equal(h.app.innerHTML, html);
+  h.emit("snapshot", {
+    repositoryId: repositoryA.id, mode: "health", seq: 9, refreshing: false,
+    syncProgress: syncTick({ revision: 41, phase: "complete", complete: true }),
+  });
+  assert.equal(h.api.isSyncActive(), false);
+  assert.equal(h.app.innerHTML, html);
+});
+
+test("repository and mode switches clear progress and accept a new scope's lower revision", async () => {
+  const select = deferred();
+  const mode = deferred();
+  const h = syncHarness({
+    fetch: path => path === "api/repositories/select" ? select.promise
+      : path === "api/mode" ? mode.promise : new Promise(() => {}),
+  });
+  seedRepository(h.api);
+  h.emit("progress", syncTick({ revision: 100, done: 777 }));
+  const selecting = h.api.selectRepository(repositoryB.id);
+  assert.equal(h.api.getProgress(), null);
+  h.emit("progress", syncTick({ revision: 101 }));
+  assert.equal(h.api.getProgress(), null);
+  select.resolve(jsonResponse(repositoryPayload(repositoryB, 1, {
+    syncProgress: syncTick({ repositoryId: repositoryB.id, syncId: "repo-b-sync", revision: 1 }),
+  })));
+  await selecting;
+  assert.equal(h.api.getProgress().repositoryId, repositoryB.id);
+  const changingMode = h.api.setMode("issues");
+  assert.equal(h.api.getProgress(), null);
+  h.emit("progress", syncTick({ repositoryId: repositoryB.id, revision: 200 }));
+  assert.equal(h.api.getProgress(), null);
+  const next = syncTick({ repositoryId: repositoryB.id, mode: "issues", syncId: "issues-sync", revision: 1 });
+  mode.resolve(jsonResponse(repositoryPayload(repositoryB, 2, { mode: "issues", syncProgress: next })));
+  await changingMode;
+  assert.equal(h.api.getProgress().mode, "issues");
+  assert.equal(h.api.getProgress().revision, 1);
+});
+
+test("same-sequence HTTP acknowledgements can advance progress but not overwrite newer stream counts", async () => {
+  const h = syncHarness();
+  const payload = progress => repositoryPayload(repositoryA, 4, { syncProgress: progress });
+  await h.api.withRefresh(async () => payload(syncTick()));
+  await h.api.withRefresh(async () => payload(syncTick({ revision: 2, done: 200 })));
+  assert.match(h.status.textContent, /200 of 42000/);
+  h.emit("progress", syncTick({ revision: 3, done: 300 }));
+  await h.api.withRefresh(async () => payload(syncTick({ revision: 2, done: 200 })));
+  assert.match(h.status.textContent, /300 of 42000/);
+  assert.equal(h.loadbar.classList.contains("active"), true);
+  h.emit("state", payload(syncTick({ revision: 4, phase: "error", complete: true })));
+  assert.equal(h.api.isSyncActive(), false);
+  assert.equal(h.section.classList.contains("failed"), true);
+});
+
+test("terminal progress cannot be rewound by a delayed same-sequence GET or refresh acknowledgement", async () => {
+  for (const phase of ["complete", "error"]) {
+    for (const requestType of ["get", "post"]) {
+      const response = deferred();
+      let reads = 0;
+      const h = syncHarness({
+        fetch: () => ++reads === 1 ? new Promise(() => {}) : response.promise,
+      });
+      const loading = repositoryPayload(repositoryA, 4, {
+        loading: true, refreshing: true, cacheStatus: "loading",
+        syncProgress: syncTick({ phase: "authenticating", done: 0, total: null }),
+      });
+      await h.api.withRefresh(async () => loading);
+      const pending = requestType === "get" ? h.api.load() : h.api.withRefresh(() => response.promise);
+      h.emit("progress", syncTick({ revision: 2, phase, complete: true, done: 1, total: 1, unit: "sync" }));
+      response.resolve(requestType === "get" ? jsonResponse(loading) : loading);
+      await pending;
+      assert.equal(h.api.getAppliedSeq(), 4);
+      assert.equal(h.api.getProgress().revision, 2, requestType + " after " + phase);
+      assert.equal(h.api.getProgress().phase, phase);
+      assert.equal(h.api.isSyncActive(), false);
+      assert.equal(h.api.getState().refreshing, false);
+      assert.equal(h.api.getState().loading, false);
+      assert.equal(h.loadbar.classList.contains("active"), false);
+      assert.equal(h.section.classList.contains("failed"), phase === "error");
+    }
+  }
+});
+
+test("late HTTP failures cannot overwrite terminal progress when dashboard sequence has not changed", async () => {
+  for (const requestType of ["get", "post"]) {
+    const response = deferred();
+    let reads = 0;
+    const h = syncHarness({
+      fetch: () => ++reads === 1 ? new Promise(() => {}) : response.promise,
+    });
+    await h.api.withRefresh(async () => repositoryPayload(repositoryA, 4, { syncProgress: syncTick() }));
+    const pending = requestType === "get" ? h.api.load() : h.api.withRefresh(() => response.promise);
+    h.emit("progress", syncTick({ revision: 2, phase: "complete", complete: true, done: 1, total: 1, unit: "sync" }));
+    response.reject(new Error("Obsolete HTTP transport failure"));
+    await pending;
+    assert.equal(h.api.getAppliedSeq(), 4);
+    assert.equal(h.api.getProgress().phase, "complete");
+    assert.equal(h.api.getLoadError(), null);
+    assert.equal(h.section.classList.contains("failed"), false);
+    assert.equal(h.api.isSyncActive(), false);
+  }
+});
+
+test("terminal error snapshots retain their provider failure rather than becoming success", () => {
+  const h = syncHarness();
+  seedRepository(h.api);
+  h.emit("progress", syncTick());
+  h.emit("state", repositoryPayload(repositoryA, 2, {
+    refreshing: false, loading: false, refreshError: "Rate limit exceeded",
+    syncProgress: syncTick({ revision: 2, phase: "error", complete: true }),
+  }));
+  assert.equal(h.api.isSyncActive(), false);
+  assert.equal(h.detail.textContent, "Rate limit exceeded");
+  assert.equal(h.section.classList.contains("failed"), true);
+  assert.equal(h.api.getState().marker, repositoryA.repository);
+});
+
+test("a cache warning or previous refresh error does not terminate an active retry", async () => {
+  for (const warning of ["Cached data could not be read; rebuilding", "Previous attempt was rate limited"]) {
+    const h = syncHarness();
+    const pending = repositoryPayload(repositoryA, 4, {
+      loading: true, refreshing: true, cacheStatus: "loading", refreshError: warning,
+      syncProgress: syncTick({ phase: "authenticating", done: 0, total: null }),
+    });
+    await h.api.withRefresh(async () => pending);
+    assert.equal(h.api.isSyncActive(), true);
+    assert.equal(h.loadbar.classList.contains("active"), true);
+    assert.equal(h.section.classList.contains("failed"), false);
+    assert.equal(h.api.getState().refreshError, warning);
+    assert.ok(h.app.innerHTML.includes(warning), "the retained warning remains visible");
+    h.emit("snapshot", {
+      repositoryId: repositoryA.id, mode: "health", seq: 4, refreshing: true,
+      refreshError: warning, prefs: pending.prefs,
+      syncProgress: syncTick({ revision: 2, done: 200 }),
+    });
+    assert.equal(h.api.isSyncActive(), true);
+    assert.match(h.status.textContent, /200 of 42000/);
+    h.emit("state", repositoryPayload(repositoryA, 5, {
+      refreshing: false, loading: false, refreshError: warning,
+      syncProgress: syncTick({ revision: 3, phase: "error", complete: true }),
+    }));
+    assert.equal(h.api.isSyncActive(), false);
+    assert.equal(h.section.classList.contains("failed"), true);
+    assert.equal(h.detail.textContent, warning);
+  }
+});
+
+test("Auto reconnect GET updates progress without re-rendering an open form", async () => {
+  let reads = 0;
+  const h = syncHarness({
+    fetch: () => ++reads === 1 ? new Promise(() => {}) : Promise.resolve(jsonResponse(
+      repositoryPayload(repositoryA, 10, { syncProgress: syncTick({ revision: 10, done: 1000 }) }),
+    )),
+  });
+  seedRepository(h.api);
+  h.api.setPrefs({ ...h.api.getPrefs(), autoApplyUpdates: true });
+  h.api.setView("settings");
+  h.api.render();
+  const html = h.app.innerHTML;
+  h.emit("snapshot", { repositoryId: repositoryA.id, mode: "health", seq: 10 });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.app.innerHTML, html);
+  assert.match(h.status.textContent, /1000 of 42000/);
+  assert.equal(h.elements["release-input"].value, "unsaved release");
+});
+
+test("same-sync older reconnect snapshots cannot roll back progress", () => {
+  const h = syncHarness();
+  seedRepository(h.api);
+  h.emit("progress", syncTick({ revision: 20, done: 2000 }));
+  h.emit("snapshot", {
+    repositoryId: repositoryA.id, mode: "health", seq: 1,
+    syncProgress: syncTick({ revision: 10, done: 1000 }),
+  });
+  assert.match(h.status.textContent, /2000 of 42000/);
+});
+
+test("an idle server restart snapshot resets sequence ordering even without progress metadata", async () => {
+  const h = syncHarness();
+  await h.api.withRefresh(async () => repositoryPayload(repositoryA, 100, {
+    syncProgress: syncTick({ revision: 200 }),
+  }));
+  h.emit("snapshot", repositoryPayload(repositoryA, 1, {
+    refreshing: false, loading: false, syncProgress: null,
+  }));
+  assert.equal(h.api.isSyncActive(), false);
+  assert.equal(h.api.getAppliedSeq(), 1);
+  h.emit("state", repositoryPayload(repositoryA, 2, {
+    refreshing: true, syncProgress: syncTick({ revision: 1, syncId: "new-process-sync" }),
+  }));
+  assert.equal(h.api.getAppliedSeq(), 2);
+  assert.equal(h.api.getProgress().syncId, "new-process-sync");
+});
+
+test("flat reconnect snapshots use prefs.mode to reject another mode's terminal state", () => {
+  const h = syncHarness();
+  seedRepository(h.api);
+  h.emit("progress", syncTick({ revision: 20 }));
+  h.emit("snapshot", {
+    repositoryId: repositoryA.id, seq: 30, refreshing: false, refreshError: "Other mode failed",
+    syncProgress: null, prefs: { ...h.api.getPrefs(), mode: "issues" },
+  });
+  assert.equal(h.api.isSyncActive(), true);
+  assert.equal(h.api.getProgress().revision, 20);
+  h.emit("snapshot", {
+    repositoryId: repositoryA.id, seq: 30, refreshing: true, refreshError: null,
+    syncProgress: syncTick({ revision: 21, done: 700 }),
+    prefs: { ...h.api.getPrefs(), mode: "health", autoApplyUpdates: false },
+  });
+  assert.match(h.status.textContent, /700 of 42000/);
+});
+
+test("repository-only error notifications read scoped provider errors without applying the dashboard", async () => {
+  let reads = 0;
+  const terminal = syncTick({ revision: 2, phase: "error", complete: true, done: 1, total: 1, unit: "sync" });
+  const h = syncHarness({
+    fetch: () => ++reads === 1 ? new Promise(() => {}) : Promise.resolve(jsonResponse(
+      repositoryPayload(repositoryA, 10, {
+        refreshing: false, loading: false, syncProgress: terminal, refreshError: "Provider rate limit exceeded",
+      }),
+    )),
+  });
+  seedRepository(h.api);
+  h.api.setPrefs({ ...h.api.getPrefs(), autoApplyUpdates: false });
+  h.api.setView("settings");
+  h.api.render();
+  const html = h.app.innerHTML;
+  h.emit("progress", syncTick());
+  h.emit("progress", terminal);
+  h.emit("refresh-error", { repositoryId: repositoryA.id, error: "Unscoped event text" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.api.isSyncActive(), false);
+  assert.equal(h.detail.textContent, "Provider rate limit exceeded");
+  assert.equal(h.app.innerHTML, html);
+  assert.equal(h.api.getAppliedSeq(), -1, "error reconciliation must not auto-apply pending data");
+  assert.equal(h.elements["release-input"].value, "unsaved release");
+});
+
+test("a delayed repository-only error cannot end newer progress or act on a foreign repository", async () => {
+  const read = deferred();
+  let reads = 0;
+  const h = syncHarness({
+    fetch: () => ++reads === 1 ? new Promise(() => {}) : read.promise,
+  });
+  seedRepository(h.api);
+  h.emit("progress", syncTick());
+  h.emit("refresh-error", { repositoryId: repositoryA.id, error: "Delayed error" });
+  h.emit("progress", syncTick({ revision: 10, syncId: "new-attempt", done: 1000 }));
+  read.resolve(jsonResponse(repositoryPayload(repositoryA, 9, {
+    refreshing: false, refreshError: "Old error",
+    syncProgress: syncTick({ revision: 2, phase: "error", complete: true, done: 1, total: 1, unit: "sync" }),
+  })));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.api.isSyncActive(), true);
+  assert.match(h.status.textContent, /1000 of 42000/);
+  assert.equal(h.api.getLoadError(), null);
+  h.emit("refresh-error", { repositoryId: repositoryB.id, error: "Foreign error" });
+  assert.equal(reads, 2, "foreign notifications must not even request current state");
+});
+
+test("terminal sync progress ends unchanged-data refreshes with Auto disabled", () => {
+  const h = syncHarness();
+  seedRepository(h.api);
+  h.api.setPrefs({ ...h.api.getPrefs(), autoApplyUpdates: false });
+  h.api.render();
+  const html = h.app.innerHTML;
+  h.emit("progress", syncTick({ initial: false }));
+  h.emit("progress", syncTick({
+    revision: 2, initial: false, phase: "complete", complete: true, done: 1, total: 1, unit: "sync",
+  }));
+  assert.equal(h.api.isSyncActive(), false);
+  assert.equal(h.loadbar.classList.contains("active"), false);
+  assert.equal(h.app.innerHTML, html);
+  assert.match(h.status.textContent, /Repository sync: Sync complete/);
+});
+
+test("progress styling uses the existing theme, polite native progress semantics and reduced motion", () => {
+  assert.match(APP_JS, /id="sync-progress-status" role="status" aria-live="polite" aria-atomic="true"/);
+  assert.match(APP_JS, /<progress id="sync-progress-bar" aria-label="Repository sync phase"/);
+  assert.doesNotMatch(APP_JS, /"8%"|Math\.max\(8,/);
+  assert.match(STYLES, /@media \(prefers-reduced-motion: reduce\)[\s\S]*\.loadbar\.indeterminate, \.sync-progress progress:indeterminate \{ animation: none; \}/);
+});
 
 function cssEscape(value) {
   return String(value).replace(/[^a-zA-Z0-9_-]/g, (ch) => `\\${ch}`);

@@ -86,7 +86,8 @@ internal static class Program
             builder.Services.AddSingleton(preferences);
             builder.Services.AddSingleton(new HttpClient { Timeout = TimeSpan.FromSeconds(45) });
             builder.Services.AddSingleton(sp => new AccountService(sp.GetRequiredService<HttpClient>(), sp.GetRequiredService<ILogger<AccountService>>()));
-            builder.Services.AddSingleton(sp => new GitHubDashboard(sp.GetRequiredService<HttpClient>(), sp.GetRequiredService<ILogger<GitHubDashboard>>()));
+            builder.Services.AddSingleton(sp => new GitHubDashboard(sp.GetRequiredService<HttpClient>(),
+                sp.GetRequiredService<ILogger<GitHubDashboard>>(), preferences.DirectoryPath));
             builder.Services.AddSingleton(sp => new HealthDashboard(sp.GetRequiredService<HttpClient>(), sp.GetRequiredService<ILogger<HealthDashboard>>()));
             builder.Services.AddSingleton(sp => new DashboardService(preferences, sp.GetRequiredService<AccountService>(),
                 sp.GetRequiredService<GitHubDashboard>(), sp.GetRequiredService<HealthDashboard>(), sp.GetRequiredService<ILogger<DashboardService>>()));
@@ -416,6 +417,17 @@ internal static class Program
                 prefs["mode"] = mode;
                 break;
             case "/api/prefs":
+                if (body.ContainsKey("maxOpenItems"))
+                {
+                    try
+                    {
+                        prefs["maxOpenItems"] = PreferenceStore.MaxOpenItems(body);
+                    }
+                    catch (InvalidDataException ex)
+                    {
+                        throw new ArgumentException(ex.Message, ex);
+                    }
+                }
                 if (body.ContainsKey("release"))
                 {
                     prefs["release"] = body.Text("release").Trim();

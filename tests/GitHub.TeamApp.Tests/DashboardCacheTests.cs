@@ -847,6 +847,9 @@ public sealed class DashboardCacheTests
         await service.WaitForRefreshAsync(Ct);
         var update = await output.Next("update-available", Ct);
         Assert.Equal("github.com/owner/a", update.Text("repositoryId"));
+        Assert.Equal("review", update.Text("mode"));
+        Assert.Equal(update.Text("syncId"), update["syncProgress"].Text("syncId"));
+        Assert.True(update["syncProgress"].Flag("complete"));
         Assert.False(service.IsLinkedPullRequest(client, "https://github.com/owner/a/pull/2"));
         Assert.True(service.IsLinkedPullRequest(client, "https://github.com/owner/a/pull/1"));
         await service.GetAsync(client, false, Ct);
@@ -918,6 +921,11 @@ public sealed class DashboardCacheTests
             Assert.False(state["dashboard"].Flag("authenticated"));
             var error = await output.Next("refresh-error", Ct);
             Assert.Equal("github.com/owner/a", error.Text("repositoryId"));
+            Assert.Equal("review", error.Text("mode"));
+            Assert.Equal(error.Text("syncId"), error["syncProgress"].Text("syncId"));
+            Assert.True(JsonNode.DeepEquals(error["revision"], error["syncProgress"]!["revision"]));
+            Assert.Equal("error", error["syncProgress"].Text("phase"));
+            Assert.True(error["syncProgress"].Flag("complete"));
             Assert.NotEmpty(error.Text("error"));
         }
         finally
@@ -1007,6 +1015,246 @@ public sealed class DashboardCacheTests
         }
     }
 
+    [Fact]
+    public async Task FirstSyncProgressIsImmediateScopedAndReplayedUntilTheCompletedSnapshotIsSaved()
+    {
+        using var fixture = new Fixture();
+        await fixture.Select("owner/a");
+        var authenticate = Signal();
+        var entered = Signal();
+        var finish = Signal();
+        using var service = fixture.ProgressService(async (accounts, prefs, ct, progress) =>
+        {
+            progress!(new("initial-items", 40, 120, "pull requests", Initial: true));
+            progress(new("initial-items", 80, 120, "pull requests", Initial: true));
+            entered.TrySetResult();
+            await finish.Task.WaitAsync(ct);
+            return Dashboard(prefs);
+        }, async (prefs, ct) =>
+        {
+            await authenticate.Task.WaitAsync(ct);
+            return Accounts(prefs);
+        });
+        var shell = await service.GetAsync(Guid.NewGuid(), false, Ct);
+        var start = shell["dashboard"]!["syncProgress"]!;
+        Assert.Equal("authenticating", start.Text("phase"));
+        Assert.Null(start["total"]);
+        Assert.Equal("github.com/owner/a", start.Text("repositoryId"));
+        Assert.Equal("review", start.Text("mode"));
+        Assert.True(start.Flag("initial"));
+        Assert.False(start.Flag("complete"));
+
+        authenticate.TrySetResult();
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5), Ct);
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        using var output = new EventOutput();
+        var context = new DefaultHttpContext { RequestAborted = stop.Token };
+        context.Response.Body = output;
+        var stream = service.StreamAsync(context, Guid.NewGuid());
+        try
+        {
+            var state = await output.Next("state", Ct);
+            var summary = await output.Next("snapshot", Ct);
+            var progress = state["dashboard"]!["syncProgress"]!;
+            Assert.Equal("initial-items", progress.Text("phase"));
+            Assert.Equal(80, progress.Number("done"));
+            Assert.Equal(120, progress.Number("total"));
+            Assert.Equal(start.Text("syncId"), progress.Text("syncId"));
+            Assert.True(progress["revision"]!.GetValue<long>() > start["revision"]!.GetValue<long>());
+            Assert.True(JsonNode.DeepEquals(progress, summary["syncProgress"]));
+            Assert.True(state["dashboard"].Flag("refreshing"));
+
+            finish.TrySetResult();
+            var completed = await output.Next("progress", Ct, p => p.Flag("complete"));
+            Assert.Equal("complete", completed.Text("phase"));
+            Assert.True(completed.Flag("initial"));
+            Assert.Equal(start.Text("syncId"), completed.Text("syncId"));
+            Assert.Equal("github.com/owner/a", completed.Text("repositoryId"));
+            var result = await service.GetAsync(Guid.NewGuid(), false, Ct);
+            Assert.False(result["dashboard"].Flag("refreshing"));
+            Assert.True(result["dashboard"]!["syncProgress"].Flag("complete"));
+            var cached = await fixture.Cache.ReadAsync(DashboardCache.Key(await fixture.Store.ReadAsync(Ct)), Ct);
+            Assert.NotNull(cached);
+            Assert.Null(cached["syncProgress"]);
+            await service.WaitForRefreshAsync(Ct);
+        }
+        finally
+        {
+            finish.TrySetResult();
+            await stop.CancelAsync();
+            await stream;
+        }
+    }
+
+    [Fact]
+    public async Task FailedSyncEndsProgressWithoutDiscardingCompleteCachedContent()
+    {
+        using var fixture = new Fixture();
+        await fixture.Select("owner/a");
+        using (var seed = fixture.Service())
+        {
+            await seed.GetAsync(Guid.NewGuid(), false, Ct);
+            await seed.WaitForRefreshAsync(Ct);
+        }
+        using var service = fixture.ProgressService((accounts, prefs, ct, progress) =>
+        {
+            progress!(new("changes", 100, null, "changes"));
+            throw new IOException("Provider failed");
+        });
+        await service.GetAsync(Guid.NewGuid(), true, Ct);
+        await service.WaitForRefreshAsync(Ct);
+        var state = await service.GetAsync(Guid.NewGuid(), false, Ct);
+        Assert.Equal("owner/a", PullRequest(state).Text("repository"));
+        Assert.Equal("cached", state["dashboard"].Text("cacheStatus"));
+        Assert.False(state["dashboard"].Flag("refreshing"));
+        Assert.NotEmpty(state["dashboard"].Text("refreshError"));
+        Assert.True(state["dashboard"]!["syncProgress"].Flag("complete"));
+        Assert.Equal("error", state["dashboard"]!["syncProgress"].Text("phase"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ProgressFromAnOldRepositoryOrModeCannotOverwriteTheCurrentSync(bool changeMode)
+    {
+        using var fixture = new Fixture();
+        await fixture.Select("owner/a");
+        var entered = Signal();
+        var release = Signal();
+        Action<SyncProgress>? oldProgress = null;
+        using var service = fixture.ProgressService(async (accounts, prefs, ct, progress) =>
+        {
+            if (RepositoryCatalog.Selected(prefs)!.Text("repository") == "owner/a" && prefs.Text("mode") == "review")
+            {
+                oldProgress = progress;
+                entered.TrySetResult();
+                await release.Task.WaitAsync(ct);
+            }
+            progress!(new("changes", 3, 5, "items"));
+            return Dashboard(prefs);
+        });
+        await service.GetAsync(Guid.NewGuid(), false, Ct);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5), Ct);
+        var old = service.WaitForRefreshAsync(Ct);
+        if (changeMode) { await fixture.Store.UpdateAsync(p => p["mode"] = "issues", Ct); }
+        else { await fixture.Select("owner/b"); }
+        service.ConfigurationChanged();
+        await service.GetAsync(Guid.NewGuid(), false, Ct);
+        await service.WaitForRefreshAsync(Ct);
+        var current = await service.GetAsync(Guid.NewGuid(), false, Ct);
+        oldProgress!(new("stale", 999, 999, "items"));
+        release.TrySetResult();
+        await old;
+        var after = await service.GetAsync(Guid.NewGuid(), false, Ct);
+        Assert.True(JsonNode.DeepEquals(current["dashboard"]!["syncProgress"], after["dashboard"]!["syncProgress"]));
+        Assert.Equal(changeMode ? "issues" : "review", after["dashboard"]!["syncProgress"].Text("mode"));
+        Assert.Equal(changeMode ? "github.com/owner/a" : "github.com/owner/b",
+            after["dashboard"]!["syncProgress"].Text("repositoryId"));
+    }
+
+    [Fact]
+    public async Task FailureAfterProviderCompletionStillEndsLoadingAndProgress()
+    {
+        using var fixture = new Fixture();
+        await fixture.Select("owner/a");
+        await fixture.Store.UpdateAsync(p => p["mode"] = "health", Ct);
+        var prefs = await fixture.Store.ReadAsync(Ct);
+        var path = Path.Combine(fixture.Store.DirectoryPath, "preferences.json");
+        using var service = fixture.ProgressService(async (accounts, configuration, ct, progress) =>
+        {
+            progress!(new("health", 1, 1, "pipelines", Initial: true));
+            await File.WriteAllTextAsync(path, "{broken", ct);
+            return Dashboard(configuration);
+        });
+        await service.GetAsync(Guid.NewGuid(), false, Ct);
+        await service.WaitForRefreshAsync(Ct);
+        Assert.Equal("{broken", await File.ReadAllTextAsync(path, Ct));
+        await File.WriteAllTextAsync(path, prefs.ToJsonString(), Ct);
+        var result = await service.GetAsync(Guid.NewGuid(), false, Ct);
+        Assert.False(result["dashboard"].Flag("refreshing"));
+        Assert.False(result["dashboard"].Flag("loading"));
+        Assert.False(result["dashboard"]!["health"].Flag("loading"));
+        Assert.Equal("error", result["dashboard"].Text("cacheStatus"));
+        Assert.NotEmpty(result["dashboard"].Text("refreshError"));
+        Assert.Equal("error", result["dashboard"]!["syncProgress"].Text("phase"));
+        Assert.True(result["dashboard"]!["syncProgress"].Flag("complete"));
+    }
+
+    [Fact]
+    public async Task LateProgressFromAnEarlierAttemptCannotRestartOrReplaceNewerProgress()
+    {
+        using var fixture = new Fixture();
+        await fixture.Select("owner/a");
+        var entered = Signal();
+        var release = Signal();
+        Action<SyncProgress>? firstProgress = null;
+        var attempts = 0;
+        using var service = fixture.ProgressService(async (accounts, prefs, ct, progress) =>
+        {
+            if (Interlocked.Increment(ref attempts) == 1) { firstProgress = progress; }
+            else
+            {
+                progress!(new("changes", 2, 3, "items"));
+                entered.TrySetResult();
+                await release.Task.WaitAsync(ct);
+            }
+            return Dashboard(prefs);
+        });
+        await service.GetAsync(Guid.NewGuid(), false, Ct);
+        await service.WaitForRefreshAsync(Ct);
+        var first = await service.GetAsync(Guid.NewGuid(), false, Ct);
+        firstProgress!(new("stale", 99, null, "items"));
+        var stillFinished = await service.GetAsync(Guid.NewGuid(), false, Ct);
+        Assert.True(JsonNode.DeepEquals(first["dashboard"]!["syncProgress"], stillFinished["dashboard"]!["syncProgress"]));
+        await service.GetAsync(Guid.NewGuid(), true, Ct);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5), Ct);
+        var second = await service.GetAsync(Guid.NewGuid(), false, Ct);
+        Assert.NotEqual(first["dashboard"]!["syncProgress"].Text("syncId"), second["dashboard"]!["syncProgress"].Text("syncId"));
+        firstProgress(new("stale", 99, null, "items"));
+        var after = await service.GetAsync(Guid.NewGuid(), false, Ct);
+        Assert.True(JsonNode.DeepEquals(second["dashboard"]!["syncProgress"], after["dashboard"]!["syncProgress"]));
+        release.TrySetResult();
+        await service.WaitForRefreshAsync(Ct);
+    }
+
+    [Fact]
+    public async Task UnchangedAutoOffPollCompletesProgressWithoutCreatingADashboardUpdate()
+    {
+        using var fixture = new Fixture();
+        await fixture.Select("owner/a");
+        await fixture.Store.UpdateAsync(p => p["autoApplyUpdates"] = false, Ct);
+        using var service = fixture.ProgressService((accounts, prefs, ct, progress) =>
+        {
+            progress!(new("changes", 0, 0, "items"));
+            return Task.FromResult(Dashboard(prefs));
+        });
+        await service.GetAsync(Guid.NewGuid(), false, Ct);
+        await service.WaitForRefreshAsync(Ct);
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        using var output = new EventOutput();
+        var context = new DefaultHttpContext { RequestAborted = stop.Token };
+        context.Response.Body = output;
+        var stream = service.StreamAsync(context, Guid.NewGuid());
+        try
+        {
+            var initial = await output.Next("state", Ct);
+            await output.Next("snapshot", Ct);
+            await service.PollAsync(Ct);
+            await service.WaitForRefreshAsync(Ct);
+            var completed = await output.Next("progress", Ct, p => p.Flag("complete"));
+            Assert.Equal("complete", completed.Text("phase"));
+            Assert.False(completed.Flag("initial"));
+            Assert.DoesNotContain("event: update-available", output.Text, StringComparison.Ordinal);
+            var result = await service.GetAsync(Guid.NewGuid(), false, Ct);
+            Assert.Equal(initial["dashboard"]!["seq"]!.GetValue<long>(), result["dashboard"]!["seq"]!.GetValue<long>());
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await stream;
+        }
+    }
+
     private static JsonObject Preferences(string repository)
     {
         var prefs = PreferenceStore.Defaults();
@@ -1083,6 +1331,11 @@ public sealed class DashboardCacheTests
             Func<IReadOnlyList<Account>, JsonObject, CancellationToken, Task<JsonObject>>? load = null) =>
             new(Store, resolve ?? ((prefs, ct) => Task.FromResult(Accounts(prefs))),
                 load ?? ((accounts, prefs, ct) => Task.FromResult(Dashboard(prefs))), NullLogger<DashboardService>.Instance);
+
+        public DashboardService ProgressService(
+            Func<IReadOnlyList<Account>, JsonObject, CancellationToken, Action<SyncProgress>?, Task<JsonObject>> load,
+            Func<JsonObject, CancellationToken, Task<IReadOnlyList<Account>>>? resolve = null) =>
+            new(Store, resolve ?? ((prefs, ct) => Task.FromResult(Accounts(prefs))), load, NullLogger<DashboardService>.Instance);
 
         public void Dispose() => _directory.Delete(recursive: true);
     }

@@ -70,8 +70,6 @@ button { font-family: inherit; cursor: pointer; }
 :focus-visible { outline: 2px solid var(--cp-accent); outline-offset: 2px; border-radius: var(--radius); }
 
 .app { display: flex; flex-direction: column; min-height: 100%; position: relative; }
-.project-picker { display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--cp-text-muted); }
-.project-picker select { max-width: min(280px, 60vw); min-height: 36px; }
 select, textarea {
   background: var(--cp-surface); color: var(--cp-text); border: 1px solid var(--cp-border);
   border-radius: var(--radius); padding: 8px 12px; font: inherit;
@@ -80,6 +78,7 @@ textarea { width: 100%; resize: vertical; }
 .field label { display: block; margin-bottom: 4px; }
 .brand .mark { color: var(--cp-accent); }
 .freshness { padding: 8px 16px; color: var(--cp-text-muted); border-bottom: 1px solid var(--cp-border); }
+.item-limit-notice { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 16px; padding: 8px 16px; color: var(--cp-text-muted); border-bottom: 1px solid var(--cp-border); }
 .repository-results { list-style: none; padding: 0; margin: 12px 0; }
 .repository-result { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 16px 0; border-bottom: 1px solid var(--cp-border); }
 .repository-result > div:first-child { flex: 1; min-width: 160px; overflow-wrap: anywhere; }
@@ -91,22 +90,48 @@ textarea { width: 100%; resize: vertical; }
 .auth-state { padding-top: 32px; }
 .doctor-report { white-space: pre-wrap; overflow-wrap: anywhere; }
 @media (max-width: 600px) {
-  .project-picker { flex: 1 1 100%; }
-  .project-picker select { flex: 1; max-width: 100%; min-width: 0; }
   .repository-result .row-actions { flex-wrap: wrap; }
 }
 
-/* Deterministic top load bar: its width tracks fetch progress (done/total) driven by the
-   SSE 'progress' events, so it advances and completes instead of looping forever. It lives
-   OUTSIDE #app so it survives full re-renders; the skeleton still covers the very first
-   load. https://primer.style/foundations/primitives/color for the accent tokens. */
+/* The top bar mirrors phase progress; unknown totals use an indeterminate segment. */
 .loadbar {
   position: fixed; left: 0; top: 0; height: 2px; width: 0; z-index: 60;
   background: linear-gradient(90deg, var(--cp-accent), var(--cp-accent));
   opacity: 0; pointer-events: none;
-  transition: width .18s ease, opacity .25s ease;
+  transition: opacity .25s ease;
 }
 .loadbar.active { opacity: 1; }
+.loadbar.indeterminate {
+  background: linear-gradient(90deg, var(--cp-surface-soft) 25%, var(--cp-accent) 50%, var(--cp-surface-soft) 75%);
+  background-size: 200% 100%;
+  animation: syncPending 1.8s linear infinite;
+}
+.sync-progress {
+  padding: 8px 16px; border-bottom: 1px solid var(--cp-border);
+  background: var(--cp-bg-elevated); color: var(--cp-text-muted);
+}
+.sync-progress[hidden], .sync-progress progress[hidden] { display: none; }
+.sync-progress.initial { padding: 20px; background: var(--cp-accent-soft); }
+.sync-progress.initial [role="status"] { color: var(--cp-text); font-size: 15px; font-weight: 600; }
+.sync-progress.failed { color: var(--cp-danger); }
+.sync-progress-detail { margin: 4px 0 0; }
+.sync-progress-detail:empty { display: none; }
+.sync-progress progress {
+  display: block; appearance: none; width: 100%; height: 4px; margin: 8px 0 0;
+  border: 0; border-radius: var(--radius); overflow: hidden;
+  background: var(--cp-border); accent-color: var(--cp-accent);
+}
+.sync-progress.initial progress { height: 8px; }
+.sync-progress progress::-webkit-progress-bar { background: transparent; }
+.sync-progress progress::-webkit-progress-value { background: var(--cp-accent); }
+.sync-progress progress::-moz-progress-bar { background: var(--cp-accent); }
+.sync-progress progress:indeterminate {
+  background: linear-gradient(90deg, var(--cp-border) 25%, var(--cp-accent) 50%, var(--cp-border) 75%);
+  background-size: 200% 100%;
+  animation: syncPending 1.8s linear infinite;
+}
+.sync-progress progress:indeterminate::-moz-progress-bar { background: transparent; }
+@keyframes syncPending { from { background-position: 100% 0; } to { background-position: -100% 0; } }
 
 /* Header */
 .topbar {
@@ -850,6 +875,8 @@ button.brand:focus-visible { outline: 2px solid var(--cp-accent); outline-offset
 .acct-chip img { width: 19px; height: 19px; border-radius: 50%; border: 1px solid var(--cp-border); flex: none; }
 .acct-chip .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .acct-chip .sdot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+.repo-chip { max-width: 280px; min-width: 0; }
+.repo-chip > svg { flex-shrink: 0; }
 
 /* Stacked / overlapping avatars for multiple active accounts */
 .stack { display: inline-flex; align-items: center; }
@@ -919,6 +946,7 @@ button.brand:focus-visible { outline: 2px solid var(--cp-accent); outline-offset
 @media (prefers-reduced-motion: reduce) {
   .view, .view.back { animation: none; }
   .loadbar { transition: opacity .25s ease; }
+  .loadbar.indeterminate, .sync-progress progress:indeterminate { animation: none; }
   .sk::after { animation: none; }
   .iconbtn.spin svg, .rescan-btn.spin svg, .card-btn.spin .cb-ico svg { animation: none; }
   .caret, .acct-detail, .notif-card, .card, .lane-body, .lane-caret, .repo-row, .repo-acts, .repo-err, .repo-ico, .health-details-chevron { transition: none; }
@@ -962,6 +990,7 @@ button.brand:focus-visible { outline: 2px solid var(--cp-accent); outline-offset
   .tab { padding: 5px; font-size: 11.5px; }
   .acct-chip { padding: 0 5px; gap: 4px; }
   .acct-chip .name { display: none; }
+  .repo-chip .name { display: block; }
   .tb-actions { gap: 4px; }
   #filters-btn { display: none; }
   .iconbtn { width: 28px; height: 28px; }

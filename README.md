@@ -48,21 +48,30 @@ confirmation before creating a session. Copilot CLI session launching is deferre
 
 ## Repositories and accounts
 
-Open **Repositories** to search GitHub using a detected account, or enter an
+Click the single repository button in the header to open the repository
+management page. Search GitHub using a detected account, or enter an
 `OWNER/REPO` name and save it. Search uses the selected account's GitHub host,
 including GitHub Enterprise Server (GHES); arbitrary API URLs are not accepted.
 The account must already be authenticated through GitHub CLI or a supported
 environment credential. **Accounts** manages credentials separately from the
 saved repository list.
 
-The header project picker selects **one repository at a time** for Review,
-Issues, Ship, and Health. Counts, notifications, actions, and refreshes belong to
+Select a saved repository row to open its dashboard. The header button shows
+the selected repository's name; click it again to return to repository
+management. Opening the already selected repository returns to its dashboard
+without changing the selection or starting another sync.
+
+Review, Issues, Ship, and Health show **one repository at a time**.
+Counts, notifications, actions, and refreshes belong to
 that repository and its assigned account; repositories are never aggregated.
 Removing a saved repository removes only local configuration, not anything on
 GitHub. There are no preselected repositories or assumed team members.
 
 Settings accepts an optional release/milestone filter and a list of GitHub team
-member logins. An empty release means no release filter. These view/filter
+member logins. **Maximum open items** defaults to **200** and accepts integers
+from **1 to 10000**. It bounds each selected repository's issue or PR queue to
+the most recently updated open items before full details are fetched. Review
+and Ship use the same PR window. An empty release means no release filter. These view/filter
 preferences are shared across projects; cached data is keyed by their values.
 Azure pipelines are explicitly added to the selected repository and are shown
 only there. Legacy account-based repository lists are migrated without dropping
@@ -72,6 +81,92 @@ write. Pass an existing data directory with `--data-dir` to migrate its settings
 
 ## Local cache and privacy
 
+### Incremental GitHub synchronization
+
+The first load selects up to `maxOpenItems` open issues or pull requests, ordered
+by `updatedAt` descending with item number descending as the stable tie-breaker.
+The default is 200, including for legacy preferences without this setting.
+Invalid settings requests or persisted values are explicitly rejected, not
+clamped or silently reset. Lightweight GraphQL inventory pages use
+`first = min(pageSize, remaining)`; only the selected items are then hydrated
+with full details. Because GitHub supports only one ordering field, timestamp
+ties crossing the window boundary require additional lightweight metadata reads
+before selecting the highest numbers. These extra reads never hydrate older
+out-of-window items; unusually large tie groups can still consume extra requests.
+
+Inventory and hydration progress totals describe the bounded target, not the
+whole repository. Delta pagination reports the number of changes read without
+an estimated total or an open-item cap.
+`dashboard.itemScope` exposes `{ limit, loaded, totalOpen, limited }`, using
+GitHub's real open-item count so the UI can explain an intentional window such
+as 200 of 10,000. Reaching the configured limit is not an incomplete-sync error.
+Each lane displays its selected items newest first; existing classification and
+the Review queue's separate attention-based selection limit still apply.
+A separate
+raw item store in `repository-items-v1` beneath the application's data directory
+survives restarts. It is keyed by canonical GitHub host/repository, account
+identity, item kind, and effective item cap, not release, team, or presentation filters. Review and
+Ship share the same PR records; Issues has its own store. No cache is written
+inside the source repository. Raw and rendered keys both include the effective
+cap, so old unbounded caches cannot bypass the new default. The version-2 raw
+envelope also stores `totalOpen`.
+
+Subsequent refreshes read GitHub's repository issues REST feed with `state=all`
+and `since` the previous successful sync timestamp, overlapping by two minutes.
+This timestamp filters by last update, not creation. The feed includes PRs
+(identified by `pull_request`) as well as issues, including closed items. It is
+read with `sort=updated&direction=asc&per_page=100` through every page, independently
+of the open-item cap.
+Every refresh authoritatively selects the current newest-open window: older
+records are dropped, newer items admitted, and gaps from closures, deletions,
+or transfers refilled. New, reopened, and changed **selected** items are hydrated
+in GraphQL batches by repository and number; historical/out-of-window REST
+changes cannot trigger unbounded full hydration. Overlapping changes whose
+timestamps are already covered by the cached item do not trigger another
+full-detail request. PR-specific details are hydrated in GraphQL batches rather
+than by using the dedicated PR-list endpoint, which has no `since` filter.
+Changes to linked issues/PRs also refresh the cached items referencing them.
+Classification, counts, notifications, and lanes are recomputed from the raw
+records using the current preferences, rather than patched in place.
+
+This is **not a delta feed for every GitHub entity**. CI, reviews, thread
+resolution, and mergeability do not reliably change a PR's `updatedAt`.
+Every PR refresh therefore also reads open-PR live state for its window and
+patches these fields locally. PRs selected from lightweight boundary-tie
+metadata receive a targeted live-state read if their full details can be reused.
+Issues use a lightweight open-issue inventory. Health remains a
+separate current provider fetch. Nested connections retain the dashboard's
+existing bounded selections (for example, 60 reviews/threads and 10 linked
+issues); this is not an archive of every nested event.
+
+A full-detail reconciliation of the selected window runs on the next refresh
+after six hours for changes missed by the REST feed, including new links not yet
+represented in cached records. Known linked-item changes refresh referring
+items only within the selected window; bounded nested connections can omit
+links, and this is not a full-repository relationship index. Initial inventory
+pagination is followed by a catch-up delta; changes to that item kind cause the
+window to be selected again before hydration.
+GitHub does not offer a transactionally consistent snapshot across these API
+calls, so concurrent edits can appear on the next refresh or reconciliation.
+Pagination is bounded at 2,000 pages per query/feed; repeated cursors/pages,
+provider errors, malformed records, and safety-limit exhaustion are explicit
+failures, never a silently complete raw cache.
+
+The committed cursor is the start of the sync (the first response's provider
+`Date` when available, otherwise the local start time), not its finish. A
+failed/cancelled fetch or hydration leaves the prior records and cursor intact.
+Successful syncs advance the cursor even when no items changed; the next sync,
+including after a restart, reads that persisted cursor rather than the rendered
+dashboard's `fetchedAt` timestamp.
+Per-key synchronization prevents overlapping project/view refreshes from
+overwriting a newer raw snapshot. Versioned records, cursor, and reconciliation
+time are committed together by atomic replacement with user-only Unix file
+permissions. Cache filename hashes are noncryptographic indexes; the exact
+identity is verified inside each envelope. Corrupt raw entries produce a warning
+and are rebuilt. ETags are not required.
+
+### Rendered snapshots and privacy
+
 Successful dashboard data is cached on disk. Startup and project/view switching
 read the matching cache immediately, without waiting for authentication or
 network discovery, then refresh in the background. The UI indicates loading,
@@ -79,7 +174,7 @@ refreshing, freshness, and errors. A failed refresh retains the last complete
 matching snapshot. Late responses cannot replace a different selected project,
 and actions are resolved against the browser's current canonical snapshot.
 
-The cache is scoped by canonical host/repository, assigned account, view, and
+The separate rendered cache is scoped by canonical host/repository, assigned account, view, and
 data-affecting filters. It is versioned and atomically replaced, with user-only
 file permissions on Unix. Corrupt or incompatible cache entries are reported and
 refetched; corrupt preferences are reported without overwriting them.
@@ -87,8 +182,16 @@ Credentials are never serialized, but cached repository data may contain private
 titles, descriptions, usernames, and CI metadata. Protect the data directory
 accordingly. Removing a repository does not erase previously cached files.
 
-`GITHUB_TEAM_APP_HOME` overrides the default local application-data directory
-(`GitHub/TeamApp` beneath the platform's local application-data folder).
+Preferences and both durable caches share the OS application-data directory,
+resolved using `Environment.SpecialFolder.LocalApplicationData`:
+
+| Platform | Default directory |
+| --- | --- |
+| macOS | `~/Library/Application Support/GitHub/TeamApp` |
+| Windows | `%LOCALAPPDATA%\GitHub\TeamApp` |
+| Linux | `$XDG_DATA_HOME/GitHub/TeamApp`, or `~/.local/share/GitHub/TeamApp` when unset |
+
+`GITHUB_TEAM_APP_HOME` overrides this default directory.
 `--data-dir` takes precedence for the server. The legacy `ASPIRE_TEAM_APP_HOME`
 environment variable is accepted for migration compatibility. CLI doctor uses
 the same environment-based directory; the web doctor uses the running server's

@@ -22,6 +22,7 @@ internal sealed class DashboardCache(string directory)
         {
             inputs[field] = scoped[field]?.DeepClone();
         }
+        inputs["maxOpenItems"] = PreferenceStore.MaxOpenItems(prefs);
         inputs["identity"] = selected is null ? null : new JsonObject
         {
             ["host"] = GitHubDashboardTransport.NormalizeHost(selected.Text("host")),
@@ -32,7 +33,9 @@ internal sealed class DashboardCache(string directory)
         return Canonical(Presentation(inputs, []))!.ToJsonString();
     }
 
-    internal string SnapshotPath(string key)
+    internal string SnapshotPath(string key) => Path.Combine(DirectoryPath, IndexFileName(key));
+
+    internal static string IndexFileName(string key)
     {
         var first = 14695981039346656037UL;
         var second = 7809847782465536322UL;
@@ -42,7 +45,7 @@ internal sealed class DashboardCache(string directory)
             second = unchecked((second ^ value) * 1099511628211UL);
         }
         // FNV-1a is only a bounded filename index. The envelope's full key is authoritative.
-        return Path.Combine(DirectoryPath, $"fnv1a-{first:x16}{second:x16}.json");
+        return $"fnv1a-{first:x16}{second:x16}.json";
     }
 
     internal async Task<JsonObject?> ReadAsync(string key, CancellationToken ct)
@@ -206,10 +209,11 @@ internal sealed class DashboardCache(string directory)
         }
     }
 
-    private async Task WriteFileAsync(string path, JsonObject envelope, CancellationToken ct)
+    internal static async Task WriteFileAsync(string path, JsonObject envelope, CancellationToken ct)
     {
-        Directory.CreateDirectory(DirectoryPath);
-        var temporary = Path.Combine(DirectoryPath, $".{Guid.NewGuid():N}.tmp");
+        var directory = Path.GetDirectoryName(path)!;
+        Directory.CreateDirectory(directory);
+        var temporary = Path.Combine(directory, $".{Guid.NewGuid():N}.tmp");
         try
         {
             var options = new FileStreamOptions

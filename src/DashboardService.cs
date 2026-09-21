@@ -12,7 +12,7 @@ internal sealed class DashboardService : BackgroundService
     private readonly PreferenceStore _preferences;
     private readonly DashboardCache _disk;
     private readonly Func<JsonObject, CancellationToken, Task<IReadOnlyList<Account>>> _resolve;
-    private readonly Func<IReadOnlyList<Account>, JsonObject, CancellationToken, Task<JsonObject>> _load;
+    private readonly Func<IReadOnlyList<Account>, JsonObject, CancellationToken, Action<SyncProgress>?, Task<JsonObject>> _load;
     private readonly ILogger<DashboardService> _logger;
     private readonly SemaphoreSlim _gate = new(1);
     private readonly Lock _sync = new();
@@ -22,19 +22,28 @@ internal sealed class DashboardService : BackgroundService
     private State? _current;
     private long _generation;
     private long _sequence;
+    private long _progressSequence;
     private DateTimeOffset _nextPoll = DateTimeOffset.UtcNow.AddSeconds(90);
 
     public DashboardService(PreferenceStore preferences, AccountService accountService,
         GitHubDashboard github, HealthDashboard health, ILogger<DashboardService> logger)
         : this(preferences, accountService.ResolveAsync,
-            (accounts, prefs, ct) => prefs.Text("mode") == "health"
-                ? health.LoadAsync(accounts, prefs, ct) : github.LoadAsync(accounts, prefs, ct), logger)
+            (accounts, prefs, ct, progress) => prefs.Text("mode") == "health"
+                ? health.LoadAsync(accounts, prefs, ct) : github.LoadAsync(accounts, prefs, ct, progress), logger)
     {
     }
 
     internal DashboardService(PreferenceStore preferences,
         Func<JsonObject, CancellationToken, Task<IReadOnlyList<Account>>> resolve,
         Func<IReadOnlyList<Account>, JsonObject, CancellationToken, Task<JsonObject>> load,
+        ILogger<DashboardService> logger)
+        : this(preferences, resolve, (accounts, prefs, ct, _) => load(accounts, prefs, ct), logger)
+    {
+    }
+
+    internal DashboardService(PreferenceStore preferences,
+        Func<JsonObject, CancellationToken, Task<IReadOnlyList<Account>>> resolve,
+        Func<IReadOnlyList<Account>, JsonObject, CancellationToken, Action<SyncProgress>?, Task<JsonObject>> load,
         ILogger<DashboardService> logger)
     {
         _preferences = preferences;
@@ -218,6 +227,7 @@ internal sealed class DashboardService : BackgroundService
                     }
                     var complete = dashboard is not null;
                     dashboard ??= Shell(prefs);
+                    dashboard.Remove("syncProgress");
                     dashboard["repositoryId"] = selected?.Text("id") ?? "";
                     dashboard["refreshing"] = false;
                     dashboard["refreshError"] = error;
@@ -244,8 +254,12 @@ internal sealed class DashboardService : BackgroundService
                     {
                         state.Snapshot["dashboard"]!["refreshing"] = true;
                         if (state.Complete) { state.Snapshot["dashboard"]!["cacheStatus"] = "cached"; }
+                        var syncId = Guid.NewGuid().ToString("N");
+                        state.SyncId = syncId;
+                        state.ProgressComplete = false;
+                        ReportProgress(state, syncId, new("authenticating", 0, null, "items", !state.Complete));
                         // Scheduling, not calling the async provider, also isolates synchronous provider prologues.
-                        state.Refresh = Task.Run(() => RefreshAsync(state, (JsonObject)prefs.DeepClone(), background, _lifetime.Token));
+                        state.Refresh = Task.Run(() => RefreshAsync(state, (JsonObject)prefs.DeepClone(), background, syncId, _lifetime.Token));
                     }
                     if (isNew) { Publish("state", state.Snapshot, state); }
                     return state;
@@ -255,11 +269,49 @@ internal sealed class DashboardService : BackgroundService
         finally { _gate.Release(); }
     }
 
-    private async Task RefreshAsync(State state, JsonObject prefs, bool background, CancellationToken ct)
+    private void ReportProgress(State state, string syncId, SyncProgress progress, bool complete = false)
+    {
+        lock (_sync)
+        {
+            if (!IsCurrent(state) || state.SyncId != syncId || state.ProgressComplete) { return; }
+            var dashboard = state.Snapshot["dashboard"]!;
+            var previousPhase = dashboard["syncProgress"].Text("phase");
+            var value = new JsonObject
+            {
+                ["repositoryId"] = dashboard["repositoryId"]?.DeepClone(),
+                ["mode"] = state.Snapshot["prefs"].Text("mode", "review"),
+                ["syncId"] = syncId,
+                ["revision"] = ++_progressSequence,
+                ["phase"] = progress.Phase,
+                ["done"] = progress.Done,
+                ["total"] = progress.Total,
+                ["unit"] = progress.Unit,
+                ["initial"] = progress.Initial,
+                ["complete"] = complete
+            };
+            dashboard["syncProgress"] = value;
+            state.InitialSync = progress.Initial;
+            state.ProgressComplete = complete;
+            var now = Environment.TickCount64;
+            // Keep the newest count in snapshots without letting rapid page reads flood the bounded SSE queue.
+            if (complete || previousPhase != progress.Phase || now - state.ProgressPublishedAt >= 100)
+            {
+                state.ProgressPublishedAt = now;
+                Publish("progress", value, state);
+            }
+        }
+    }
+
+    private void CompleteProgress(State state, string syncId, bool failed)
+    {
+        ReportProgress(state, syncId, new(failed ? "error" : "complete", 1, 1, "sync", state.InitialSync), complete: true);
+    }
+
+    private async Task RefreshAsync(State state, JsonObject prefs, bool background, string syncId, CancellationToken ct)
     {
         try
         {
-            await RefreshCoreAsync(state, prefs, background, ct);
+            await RefreshCoreAsync(state, prefs, background, syncId, ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
         catch (Exception ex)
@@ -270,17 +322,25 @@ internal sealed class DashboardService : BackgroundService
                 if (!IsCurrent(state)) { return; }
                 state.Snapshot = (JsonObject)state.Snapshot.DeepClone();
                 state.Snapshot["dashboard"]!["refreshing"] = false;
+                state.Snapshot["dashboard"]!["loading"] = false;
+                state.Snapshot["dashboard"]!["cacheStatus"] = state.Complete ? "cached" : "error";
+                if (state.Snapshot["dashboard"]!["health"] is JsonObject health) { health["loading"] = false; }
                 state.Snapshot["dashboard"]!["refreshError"] = "Dashboard refresh could not be completed. Check preferences and cache access, then retry.";
+                CompleteProgress(state, syncId, failed: true);
                 Publish("refresh-error", new JsonObject
                 {
                     ["repositoryId"] = state.Snapshot["dashboard"]!["repositoryId"]?.DeepClone(),
+                    ["mode"] = state.Snapshot["prefs"].Text("mode", "review"),
+                    ["syncId"] = syncId,
+                    ["revision"] = state.Snapshot["dashboard"]!["syncProgress"]?["revision"]?.DeepClone(),
+                    ["syncProgress"] = state.Snapshot["dashboard"]!["syncProgress"]?.DeepClone(),
                     ["error"] = state.Snapshot["dashboard"]!["refreshError"]?.DeepClone()
                 }, state);
             }
         }
     }
 
-    private async Task RefreshCoreAsync(State state, JsonObject prefs, bool background, CancellationToken ct)
+    private async Task RefreshCoreAsync(State state, JsonObject prefs, bool background, string syncId, CancellationToken ct)
     {
         JsonObject? dashboard = null;
         JsonObject? partial = null;
@@ -296,7 +356,8 @@ internal sealed class DashboardService : BackgroundService
             {
                 throw new InvalidDataException("No active account is available for the selected repository.");
             }
-            dashboard = await _load(active, scoped, ct);
+            ReportProgress(state, syncId, new("items", 0, null, "items", !state.Complete));
+            dashboard = await _load(active, scoped, ct, progress => ReportProgress(state, syncId, progress));
             var failed = HasProviderFailure(dashboard);
             dashboard["repositoryId"] = RepositoryCatalog.Selected(prefs)!.Text("id");
             var metadata = ScopedMetadata(JsonData.Array(accounts.Select(DashboardCache.Metadata)), RepositoryCatalog.Selected(prefs));
@@ -335,6 +396,7 @@ internal sealed class DashboardService : BackgroundService
             }
             if (dashboard is not null)
             {
+                ReportProgress(state, syncId, new("saving", 0, null, "items", state.InitialSync));
                 try
                 {
                     await _disk.WriteAsync(state.Key, dashboard, ct);
@@ -370,6 +432,7 @@ internal sealed class DashboardService : BackgroundService
                 dashboard["seq"] = changed ? ++_sequence : _sequence;
                 state.Complete |= complete;
                 state.Snapshot = new JsonObject { ["dashboard"] = dashboard, ["prefs"] = latest };
+                CompleteProgress(state, syncId, error.Length > 0);
                 if (!background || latest.Flag("autoApplyUpdates", true))
                 {
                     Publish("state", state.Snapshot, state);
@@ -380,6 +443,10 @@ internal sealed class DashboardService : BackgroundService
                     {
                         ["seq"] = _sequence,
                         ["repositoryId"] = dashboard["repositoryId"]?.DeepClone(),
+                        ["mode"] = latest.Text("mode", "review"),
+                        ["syncId"] = syncId,
+                        ["revision"] = dashboard["syncProgress"]?["revision"]?.DeepClone(),
+                        ["syncProgress"] = dashboard["syncProgress"]?.DeepClone(),
                         ["fetchedAt"] = dashboard["fetchedAt"]?.DeepClone(),
                         ["refreshing"] = false,
                         ["refreshError"] = error,
@@ -391,6 +458,10 @@ internal sealed class DashboardService : BackgroundService
                     Publish("refresh-error", new JsonObject
                     {
                         ["repositoryId"] = dashboard["repositoryId"]?.DeepClone(),
+                        ["mode"] = latest.Text("mode", "review"),
+                        ["syncId"] = syncId,
+                        ["revision"] = dashboard["syncProgress"]?["revision"]?.DeepClone(),
+                        ["syncProgress"] = dashboard["syncProgress"]?.DeepClone(),
                         ["error"] = error
                     }, state);
                 }
@@ -466,11 +537,13 @@ internal sealed class DashboardService : BackgroundService
                     channel.Writer.TryWrite(new("snapshot", new JsonObject
                     {
                         ["repositoryId"] = state.Snapshot["dashboard"]?["repositoryId"]?.DeepClone(),
+                        ["mode"] = state.Snapshot["prefs"].Text("mode", "review"),
                         ["seq"] = state.Snapshot["dashboard"]?["seq"]?.DeepClone(),
                         ["fetchedAt"] = state.Snapshot["dashboard"]?["fetchedAt"]?.DeepClone(),
                         ["refreshing"] = state.Snapshot["dashboard"]?["refreshing"]?.DeepClone(),
                         ["refreshError"] = state.Snapshot["dashboard"]?["refreshError"]?.DeepClone(),
                         ["cacheStatus"] = state.Snapshot["dashboard"]?["cacheStatus"]?.DeepClone(),
+                        ["syncProgress"] = state.Snapshot["dashboard"]?["syncProgress"]?.DeepClone(),
                         ["prefs"] = state.Snapshot["prefs"]?.DeepClone(),
                         ["nextPollAt"] = _nextPoll.ToUnixTimeMilliseconds()
                     }, state.Key, state.Generation));
@@ -565,6 +638,7 @@ internal sealed class DashboardService : BackgroundService
         content.Remove("fetchedAt");
         content.Remove("refreshing");
         content.Remove("cacheStatus");
+        content.Remove("syncProgress");
         return content;
     }
 
@@ -604,6 +678,10 @@ internal sealed class DashboardService : BackgroundService
         public JsonObject Snapshot { get; set; } = snapshot;
         public bool Complete { get; set; } = complete;
         public Task? Refresh { get; set; }
+        public string SyncId { get; set; } = "";
+        public bool ProgressComplete { get; set; }
+        public bool InitialSync { get; set; }
+        public long ProgressPublishedAt { get; set; }
     }
     private sealed record Event(string Name, JsonObject Data, string Key, long Generation);
     private sealed record Subscription(Guid Client, Channel<Event> Messages);

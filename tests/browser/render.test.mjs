@@ -1364,14 +1364,15 @@ function formElement(value = "", checked = false) {
   return { value, checked, addEventListener() {}, classList: classList(), setAttribute() {} };
 }
 
-test("single repository button remains available before load, unauthenticated, and after failure", () => {
+test("repository dropdown and management cog remain visible before load, unauthenticated, and after failure", () => {
   const { app, api } = createRendererHarness({ fetch: () => new Promise(() => {}) });
   for (const state of [null, { authenticated: false, accounts: [], message: "" }]) {
     api.setState(state);
     api.render();
-    assert.doesNotMatch(app.innerHTML, /repository-picker|project-picker/);
     assert.equal((app.innerHTML.match(/id="repositories-btn"/g) || []).length, 1);
-    assert.match(app.innerHTML, /class="acct-chip repo-chip [^"]*" id="repositories-btn"/);
+    assert.match(app.innerHTML, /class="acct-chip cb-caret repo-chip" id="repositories-btn"/);
+    assert.match(app.innerHTML, /id="repositories-btn"[^>]*aria-haspopup="menu"[^>]*disabled/);
+    assert.match(app.innerHTML, /id="manage-repositories-btn"[^>]*aria-label="Manage repositories"/);
     assert.match(app.innerHTML, /<span class="name">Repositories<\/span>/);
   }
   api.setState(null);
@@ -1394,10 +1395,10 @@ test("accounts no longer edit repositories, and the repositories page preserves 
   api.setView("repositories");
   api.render();
   assert.match(app.innerHTML, /data-repository-select="ghe.example.com\/team\/beta"/);
-  assert.match(app.innerHTML, /<b>Team\/Beta<\/b><p>ghe.example.com/);
+  assert.match(app.innerHTML, /<b>Team\/Beta<\/b><span class="meta">ghe.example.com/);
   assert.match(app.innerHTML, /acct:ghe.example.com\/octo/);
   assert.match(app.innerHTML, /data-repository-remove="github.com\/octo\/alpha"/);
-  assert.match(app.innerHTML, /<select id="repository-account">/);
+  assert.match(app.innerHTML, /id="repository-account"[^>]*aria-haspopup="menu"/);
   assert.doesNotMatch(app.innerHTML, /<input[^>]*(?:id|name)="[^"]*host/i);
 });
 
@@ -1433,13 +1434,13 @@ test("empty startup labels its button Repositories without posting an empty sele
   assert.ok(!requests.includes("api/repositories/select"));
 });
 
-test("repository chip opens management, selecting opens the dashboard, and the named chip reopens management", async () => {
+test("repository cog opens management and compact repository rows open their dashboard", async () => {
   const handlers = {};
   const selected = deferred();
   const chip = { addEventListener(event, handler) { handlers.chip = handler; } };
   const row = { dataset: { repositorySelect: repositoryB.id }, addEventListener(event, handler) { handlers.select = handler; } };
   const { app, api } = createRendererHarness({
-    elements: { "repositories-btn": chip },
+    elements: { "manage-repositories-btn": chip },
     querySelectorAll: selector => selector === "[data-repository-select]" ? [row] : [],
     fetch: path => path === "api/repositories/select" ? selected.promise : new Promise(() => {}),
   });
@@ -1447,20 +1448,158 @@ test("repository chip opens management, selecting opens the dashboard, and the n
   api.render();
   handlers.chip();
   assert.match(app.innerHTML, /<h2>Repositories<\/h2>/);
-  assert.match(app.innerHTML, /id="repositories-btn"[^>]*aria-expanded="true"/);
+  assert.match(app.innerHTML, /id="repositories-btn"[^>]*aria-expanded="false"/);
   const selecting = handlers.select();
   assert.doesNotMatch(app.innerHTML, /<h2>Repositories<\/h2>/);
   assert.match(app.innerHTML, /Loading repository/);
   assert.match(app.innerHTML, /<span class="name">Team\/Beta<\/span>/);
-  assert.match(app.innerHTML, /Team\/Beta \(ghe.example.com\) - Select and manage repositories/);
+  assert.match(app.innerHTML, /Team\/Beta \(ghe.example.com\) - Select repository/);
   selected.resolve(jsonResponse(repositoryPayload(repositoryB, 2)));
   await selecting;
   assert.equal(api.getState().cacheStatus, "cached");
   handlers.chip();
   assert.match(app.innerHTML, /<h2>Repositories<\/h2>/);
-  assert.match(app.innerHTML, /data-repository-select="ghe.example.com\/team\/beta">Open selected/);
+  assert.match(app.innerHTML, /data-repository-select="ghe.example.com\/team\/beta" aria-current="true"/);
   handlers.chip();
   assert.doesNotMatch(app.innerHTML, /<h2>Repositories<\/h2>/);
+});
+
+test("repository dropdown opens without navigating and selects canonical repository ids", async () => {
+  const calls = [];
+  const h = choiceHarness("repositories-btn", [repositoryA.id, repositoryB.id], {
+    fetch: (path, options) => {
+      if (path !== "api/repositories/select") return new Promise(() => {});
+      calls.push(JSON.parse(options.body));
+      return Promise.resolve(jsonResponse(repositoryPayload(repositoryB, 2)));
+    },
+  });
+  seedRepository(h.api);
+  h.api.render();
+  h.trigger.listeners.click(h.event());
+  assert.equal(h.menu.hidden, false);
+  assert.equal(h.trigger.getAttribute("aria-expanded"), "true");
+  assert.equal(h.document.activeElement, h.items[0]);
+  assert.equal(h.api.getView(), "queue");
+  h.items[1].listeners.click(h.event());
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.menu.hidden, true);
+  assert.equal(h.trigger.getAttribute("aria-expanded"), "false");
+  assert.deepEqual(calls, [{ id: repositoryB.id }]);
+  assert.equal(h.api.getPrefs().selectedRepository, repositoryB.id);
+  assert.equal(h.api.getState().repositoryId, repositoryB.id);
+});
+
+test("choice dropdowns support keyboard navigation, dismissal, and scrolling their own options", () => {
+  const h = choiceHarness("repositories-btn", ["alpha", "beta", "gamma"]);
+  seedRepository(h.api);
+  h.api.render();
+  h.trigger.listeners.keydown(h.event("ArrowDown"));
+  assert.equal(h.document.activeElement, h.items[0]);
+  for (const [key, index] of [["ArrowDown", 1], ["End", 2], ["ArrowDown", 0], ["ArrowUp", 2], ["Home", 0], ["b", 1]]) {
+    const event = h.event(key);
+    h.menu.listeners.keydown(event);
+    assert.equal(h.document.activeElement, h.items[index], key);
+    assert.equal(event.prevented, true, key);
+  }
+  h.documentListeners.scroll({ target: { closest: () => h.menu } });
+  assert.equal(h.menu.hidden, false);
+  const escape = h.event("Escape");
+  h.menu.listeners.keydown(escape);
+  assert.equal(escape.prevented, true);
+  assert.equal(h.menu.hidden, true);
+  assert.equal(h.document.activeElement, h.trigger);
+  h.trigger.listeners.keydown(h.event("ArrowUp"));
+  assert.equal(h.document.activeElement, h.items[2]);
+  const tab = h.event("Tab");
+  h.menu.listeners.keydown(tab);
+  assert.equal(tab.prevented, false);
+  assert.equal(h.menu.hidden, true);
+  assert.equal(h.document.activeElement, h.trigger);
+  for (const dismiss of [
+    () => h.documentListeners.click(),
+    () => h.documentListeners.focusin({ target: {} }),
+    () => h.documentListeners.scroll({ target: {} }),
+  ]) {
+    h.trigger.listeners.click(h.event());
+    assert.equal(h.menu.hidden, false);
+    dismiss();
+    assert.equal(h.menu.hidden, true);
+    assert.equal(h.trigger.getAttribute("aria-expanded"), "false");
+  }
+});
+
+const repositoryAccounts = [
+  { id: repositoryA.accountId, login: "octo", host: "github.com", active: true, status: "ok", avatarUrl: "https://avatars.githubusercontent.com/u/1" },
+  { id: repositoryB.accountId, login: "enterprise-octo", host: "ghe.example.com", active: false, status: "ok", avatarUrl: "https://ghe.example.com/avatar/2" },
+];
+
+test("management account dropdown shares header avatars and initially selects the repository account", () => {
+  const { app, api } = createRendererHarness({ fetch: () => new Promise(() => {}) });
+  seedRepository(api, repositoryB);
+  api.setState({ ...api.getState(), accounts: repositoryAccounts, activeAccounts: [repositoryAccounts[0]] });
+  api.goView("repositories");
+  assert.equal(api.getRepositoryAccount(), repositoryB.accountId);
+  assert.match(app.innerHTML, /id="repository-account"[^>]*aria-label="GitHub account: enterprise-octo \(ghe.example.com\)"/);
+  assert.match(app.innerHTML, /id="repository-account"[\s\S]*?<img class="acct-av" src="https:\/\/ghe.example.com\/avatar\/2"/);
+  assert.deepEqual([...app.innerHTML.matchAll(/aria-checked="true" data-choice="([^"]+)"/g)].map(match => match[1]),
+    [repositoryB.id, repositoryB.accountId]);
+  assert.match(app.innerHTML, /id="repository-search"[^>]*placeholder="Search or enter owner\/repo" \/>/);
+});
+
+test("account dropdown changes preserve the query and rescope search, then default to the current repository on return", async () => {
+  const searches = [];
+  const h = choiceHarness("repository-account", repositoryAccounts.map(a => a.id), {
+    fetch: path => {
+      if (!path.startsWith("api/repositories/search")) return new Promise(() => {});
+      searches.push(Object.fromEntries(new URL(path, "http://localhost/").searchParams));
+      return Promise.resolve(jsonResponse({ items: [] }));
+    },
+  });
+  seedRepository(h.api);
+  h.api.setState({ ...h.api.getState(), accounts: repositoryAccounts });
+  h.api.goView("repositories");
+  h.api.scheduleRepositorySearch(repositoryA.accountId, "team/app");
+  h.trigger.listeners.click(h.event());
+  h.items[1].listeners.click(h.event());
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.api.getRepositoryAccount(), repositoryB.accountId);
+  assert.deepEqual(searches, [
+    { accountId: repositoryA.accountId, q: "team/app" },
+    { accountId: repositoryB.accountId, q: "team/app" },
+  ]);
+  h.api.render();
+  assert.equal(h.api.getRepositoryAccount(), repositoryB.accountId, "ordinary renders preserve an explicit choice");
+  h.api.goView("queue");
+  h.api.goView("repositories");
+  assert.equal(h.api.getRepositoryAccount(), repositoryA.accountId);
+});
+
+test("account default uses an available active credential, then the first usable account", () => {
+  for (const [accounts, expected] of [
+    [[{ ...repositoryAccounts[0], status: "failed" }, repositoryAccounts[1]], repositoryB.accountId],
+    [[{ ...repositoryAccounts[0], active: false }, { ...repositoryAccounts[1], active: true }], repositoryB.accountId],
+    [[{ ...repositoryAccounts[0], active: false }, repositoryAccounts[1]], repositoryA.accountId],
+    [[], ""],
+  ]) {
+    const { api } = createRendererHarness({ fetch: () => new Promise(() => {}) });
+    seedRepository(api, null);
+    api.setState({ ...api.getState(), accounts, activeAccounts: [] });
+    api.goView("repositories");
+    assert.equal(api.getRepositoryAccount(), expected);
+  }
+});
+
+test("repository icons use the public owner avatar or a generic icon, including image failures", () => {
+  const events = {};
+  const { api } = createRendererHarness({ document: { addEventListener(name, handler) { events[name] = handler; } } });
+  const publicIcon = api.repositoryIcon(repositoryA);
+  const enterpriseIcon = api.repositoryIcon(repositoryB);
+  assert.match(publicIcon, /src="https:\/\/github.com\/Octo.png\?size=40"/);
+  assert.equal((enterpriseIcon.match(/<svg /g) || []).length, 1);
+  assert.deepEqual([...enterpriseIcon.matchAll(/<img[^>]+src="([^"]+)"/g)].map(match => match[1]), []);
+  let removed = false;
+  events.error({ target: { tagName: "IMG", hasAttribute: name => name === "data-repository-avatar", remove() { removed = true; } } });
+  assert.equal(removed, true, "removing a broken image reveals the generic icon underneath");
 });
 
 test("repository switching clears old content immediately, applies cache, then accepts only matching SSE", async () => {
@@ -1497,6 +1636,9 @@ test("opening the current repository returns to its cached dashboard without sta
   assert.equal(api.getState().cacheStatus, "cached");
   assert.doesNotMatch(app.innerHTML, /<h2>Repositories<\/h2>/);
   assert.ok(!requests.includes("api/repositories/select"));
+  await api.selectRepository(repositoryA.id);
+  assert.equal(api.getState(), dashboard);
+  assert.deepEqual(requests.filter(path => path === "api/repositories/select"), []);
 });
 
 test("leaving repository management cancels credential discovery before selecting and ignores its late error", async () => {
@@ -1539,7 +1681,7 @@ test("A then B selection serializes server writes and ignores late A responses a
         return calls.length === 1 ? first.promise : second.promise;
       },
     });
-    seedRepository(api);
+    seedRepository(api, null);
     const a = api.selectRepository(repositoryA.id);
     await Promise.resolve();
     const b = api.selectRepository(repositoryB.id);
@@ -2141,6 +2283,7 @@ function createRendererHarness(overrides = {}) {
     querySelectorAll: overrides.querySelectorAll ?? (() => []),
     createElement: overrides.createElement ?? (() => ({})),
     addEventListener() {},
+    ...overrides.document,
   };
   const sandbox = {
     document,
@@ -2163,6 +2306,9 @@ function createRendererHarness(overrides = {}) {
   vm.runInNewContext(`${APP_JS}\n;globalThis.__test = {\n  render,\n  withRefresh,\n  load,\n  rescanAccounts,\n  onCardAction,\n  applyPushedState,\n  onUpdateAvailable,\n  onPreferences,\n  onSnapshot,\n  onPollSchedule,\n  applyAvailableUpdate,\n  toggleAutoApply,\n  autoApplyEnabled,\n  openLinkedPr,\n  selectRepository,\n  mutateRepository,\n  scheduleRepositorySearch,\n  searchRepositories,\n  repositoriesView,\n  currentAccounts,\n  goView,\n  saveSettings,\n  runDoctor,\n  saveSessionProject,\n  settingsView,\n  captureSettingsDraft,\n  restoreSettingsDraft,\n  forYouCardActions,\n  focusCardActions,\n  laneCardActions,\n  signalActions,\n  mergeActions,\n  queuePanel,\n  cardActionBtn,\n  issueCard,\n  healthCard,\n  healthView,\n  healthRepositoryGroups,\n  pipelineEditorHtml,\n  addAzurePipeline,\n  removeAzurePipeline,\n  commitHealthOrder,\n  moveHealthSource,\n  dropHealthSource,\n  setHealthDropMarker,\n  wireHealthOrdering,\n  actionKey,\n  inflightActions,\n  setProgress,\n  setState(value) { state = value; },\n  getState() { return state; },\n  getAppliedSeq() { return lastAppliedSeq; },\n  getUpdateAvailable() { return updateAvailable; },\n  setPrefs(value) { prefs = value; },\n  getPrefs() { return prefs; },\n  setHealthOrderSaving(value) { healthOrderSaving = !!value; },\n  setPipelineDrafts(url, branch) { pipelineUrlDraft = url; pipelineBranchDraft = branch; },\n  getPipelineDrafts() { return { url: pipelineUrlDraft, branch: pipelineBranchDraft, error: pipelineError }; },\n  setView(value) { view = value; },\n  setRefreshing(value) { refreshing = !!value; },\n  setRefreshInFlight(value) { refreshInFlight = value; },\n  setLoadError(value) { loadError = value; },\n  getLoadError() { return loadError; },\n};`, sandbox);
 
   vm.runInNewContext(`Object.assign(__test, {
+    repositoryIcon,
+    getView() { return view; },
+    getRepositoryAccount() { return repositoryAccount; },
     onProgress, setMode, renderSyncProgress,
     activeNotifications, dismissedNotificationCount, noticeAction, statusNoticeHtml,
     updateStatusNotices, dismissNotif, dismissAll, restoreNotifs, hideToast,
@@ -2170,7 +2316,65 @@ function createRendererHarness(overrides = {}) {
     getProgress() { return syncProgress; },
     isSyncActive() { return syncActive; }
   });`, sandbox);
-  return { app, api: sandbox.__test };
+  return { app, api: sandbox.__test, document };
+}
+
+function choiceHarness(id, choices, overrides = {}) {
+  let document;
+  const documentListeners = {};
+  function element() {
+    const attributes = new Map();
+    return {
+      listeners: {}, style: {}, classList: classList(), isConnected: true,
+      addEventListener(name, handler) { this.listeners[name] = handler; },
+      setAttribute(name, value) { attributes.set(name, value); },
+      getAttribute(name) { return attributes.get(name); },
+      focus() { document.activeElement = this; },
+      appendChild(child) { child.parentElement = this; },
+      getBoundingClientRect() { return { left: 100, top: 20, bottom: 50 }; },
+    };
+  }
+  const body = element();
+  const owner = element();
+  const trigger = element();
+  trigger.parentElement = owner;
+  const items = choices.map((choice, index) => {
+    const item = element();
+    item.dataset = { choice };
+    item.textContent = choice;
+    item.setAttribute("aria-checked", String(index === 0));
+    item.querySelector = () => ({ textContent: choice });
+    return item;
+  });
+  const menu = {
+    ...element(), hidden: true, parentElement: owner, offsetWidth: 280, offsetHeight: 150,
+    querySelectorAll: () => items,
+    querySelector: () => items[0],
+    contains: target => items.includes(target),
+    remove() { this.parentElement = null; },
+  };
+  menu.classList.add("choice-menu");
+  const harness = createRendererHarness({
+    ...overrides,
+    elements: { [id]: trigger, [id + "-menu"]: menu },
+    document: {
+      body, documentElement: { clientWidth: 1024, clientHeight: 768 },
+      addEventListener(name, handler) { documentListeners[name] = handler; },
+    },
+    querySelectorAll(selector) {
+      if (selector === ".cb-menu" || selector === ".choice-menu") return [menu];
+      if (selector === '.cb-caret[aria-expanded="true"]') return [trigger];
+      if (selector === "body > .cb-menu") return menu.parentElement === body ? [menu] : [];
+      return [];
+    },
+  });
+  document = harness.document;
+  return {
+    ...harness, trigger, menu, items, documentListeners,
+    event(key) {
+      return { key, prevented: false, preventDefault() { this.prevented = true; }, stopPropagation() {} };
+    },
+  };
 }
 
 function dragCard() {

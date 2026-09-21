@@ -92,15 +92,42 @@ function matchesRepository(payload) {
 function currentAccounts() {
   return discoveredAccounts || (state && state.accounts) || [];
 }
+function choiceDropdown(id, label, content, items, cssClass, disabled) {
+  return '<div class="choice-dropdown"><button class="acct-chip cb-caret ' + cssClass +
+    '" id="' + id + '" type="button" title="' + esc(label) + '" aria-label="' + esc(label) +
+    '" aria-haspopup="menu" aria-expanded="false" aria-controls="' + id + '-menu"' +
+    (disabled || !items.length ? " disabled" : "") + '>' + content + ICONS.chev + '</button>' +
+    '<div class="cb-menu choice-menu" id="' + id + '-menu" role="menu" aria-labelledby="' + id + '" hidden>' +
+    items.map(item => '<button class="cb-menu-item choice-item" type="button" role="menuitemradio" tabindex="-1"' +
+      ' aria-checked="' + item.selected + '" data-choice="' + esc(item.id) + '">' + item.content +
+      '<span class="choice-check" aria-hidden="true">' + (item.selected ? ICONS.check : "") + '</span></button>').join("") +
+    '</div></div>';
+}
+function repositoryIcon(repo) {
+  // GitHub repositories use their owner's avatar; GHES identities must not fall back
+  // to an unrelated github.com owner. A failed image reveals the generic repository icon.
+  const owner = repo?.repository?.split("/")[0];
+  const url = repo?.host === "github.com" && owner
+    ? "https://github.com/" + encodeURIComponent(owner) + ".png?size=40" : "";
+  return '<span class="repository-icon" aria-hidden="true">' + ICONS.repo +
+    (url ? '<img src="' + esc(url) + '" alt="" referrerpolicy="no-referrer" loading="lazy" data-repository-avatar />' : "") +
+    '</span>';
+}
 function repositoryChip() {
-  const selected = (prefs?.repositories || []).find(repo => repo.id === prefs?.selectedRepository);
+  const repositories = prefs?.repositories || [];
+  const selected = repositories.find(repo => repo.id === prefs?.selectedRepository);
   const name = selected?.repository || "Repositories";
-  const title = selected ? selected.repository + " (" + selected.host + ") - Select and manage repositories" : "Select and manage repositories";
-  return '<button class="acct-chip repo-chip ' + (view === "repositories" ? "active" : "") +
-    '" id="repositories-btn" type="button" title="' + esc(title) + '" aria-label="' +
-    esc(selected ? name + " - Repositories" : name) + '" aria-expanded="' + (view === "repositories") + '"' +
-    (repositorySaving ? " disabled" : "") + '>' + ICONS.layers + '<span class="name">' + esc(name) +
-    "</span>" + ICONS.chev + "</button>";
+  const title = selected ? selected.repository + " (" + selected.host + ") - Select repository" : "Select repository";
+  return '<div class="repository-controls">' +
+    choiceDropdown("repositories-btn", title, repositoryIcon(selected) + '<span class="name">' + esc(name) + '</span>',
+      repositories.map(repo => ({
+        id: repo.id, selected: repo.id === prefs.selectedRepository,
+        content: repositoryIcon(repo) + '<span class="choice-text"><span class="choice-name">' + esc(repo.repository) +
+          '</span><span class="meta">' + esc(repo.host) + '</span></span>',
+      })), "repo-chip", repositorySaving) +
+    '<button class="iconbtn ' + (view === "repositories" ? "active" : "") +
+    '" id="manage-repositories-btn" type="button" title="Manage repositories" aria-label="Manage repositories">' +
+    ICONS.gear + '</button></div>';
 }
 function emptyDashboard(id) {
   return {
@@ -119,7 +146,7 @@ async function selectRepository(id) {
     return;
   }
   if (repositorySaving) return;
-  if (view === "repositories" && id === prefs?.selectedRepository && state?.repositoryId === id && !selectionPending && !loadError) {
+  if (id === prefs?.selectedRepository && state?.repositoryId === id && !selectionPending && !loadError) {
     goView("queue", false);
     return;
   }
@@ -155,7 +182,9 @@ async function selectRepository(id) {
   } finally {
     if (generation === scopeGeneration) {
       selectionPending = false;
+      const restoreFocus = document.activeElement?.id === "repositories-btn";
       render();
+      if (restoreFocus) document.getElementById("repositories-btn")?.focus();
     }
   }
 }
@@ -256,22 +285,38 @@ async function mutateRepository(action, value) {
 function repositoriesView() {
   const accounts = currentAccounts().filter(a => a.status !== "failed");
   const repositories = prefs?.repositories || [];
+  if (!accounts.some(a => a.id === repositoryAccount)) {
+    const selected = repositories.find(repo => repo.id === prefs?.selectedRepository);
+    repositoryAccount = accounts.find(a => a.id === selected?.accountId)?.id ||
+      accounts.find(a => a.active || state?.activeAccounts?.some(active => active.id === a.id))?.id ||
+      accounts[0]?.id || "";
+  }
+  const account = accounts.find(a => a.id === repositoryAccount);
   return '<div class="page"><div class="page-head"><h2>Repositories</h2>' +
-    '<p>Select a repository below to open its Review, Issues, Ship, or Health dashboard. Use the repository button to return here and manage your saved list.</p></div>' +
+    '<p>Select a repository to open its dashboard. Switch from the header dropdown, or use its cog to manage this list.</p></div>' +
     '<div class="section"><h3>Your repositories</h3><ul class="repository-results">' +
-    (repositories.length ? repositories.map(repo =>
-      '<li class="repository-result"><div><b>' + esc(repo.repository) + '</b><p>' + esc(repo.host) +
-      ' &middot; ' + esc(repo.accountId) + '</p></div><div class="row-actions">' +
-      '<button class="btn ghost" type="button" data-repository-select="' + esc(repo.id) + '"' + (repositorySaving ? " disabled" : "") + '>' +
-      (repo.id === prefs.selectedRepository ? "Open selected" : "Select") + '</button>' +
-      '<button class="btn ghost" type="button" data-repository-remove="' + esc(repo.id) + '"' +
+    (repositories.length ? repositories.map(repo => {
+      const ownerAccount = currentAccounts().find(a => a.id === repo.accountId);
+      const selected = repo.id === prefs.selectedRepository;
+      return '<li class="repository-result"><button class="repository-open" type="button" data-repository-select="' +
+      esc(repo.id) + '" aria-current="' + selected + '"' + (repositorySaving ? " disabled" : "") + '>' +
+      repositoryIcon(repo) + '<span class="repository-summary"><b>' + esc(repo.repository) +
+      '</b><span class="meta">' + esc(repo.host) + ' &middot; ' + esc(ownerAccount?.login || repo.accountId) +
+      '</span></span>' + (selected ? '<span class="repository-selected">Selected</span>' : "") + '</button>' +
+      '<button class="repo-ico danger" type="button" data-repository-remove="' + esc(repo.id) + '"' +
       (repositorySaving || selectionPending ? " disabled" : "") + ' aria-label="Remove ' + esc(repo.repository) +
-      '">Remove</button></div></li>').join("") : '<li class="repo-empty">No repositories yet. Add one below.</li>') +
+      '" title="Remove ' + esc(repo.repository) + '">' + ICONS.trash + '</button></li>';
+    }).join("") : '<li class="repo-empty">No repositories yet. Add one below.</li>') +
     '</ul></div><div class="section"><h3>Add a repository</h3><p class="hint">Search using an existing GitHub credential, or enter an exact owner/repo. Credentials are managed separately in Accounts.</p>' +
-    '<label for="repository-account">GitHub account</label><div class="field"><select id="repository-account">' +
-    '<option value="">Choose an account</option>' + accounts.map(a => '<option value="' + esc(a.id) + '"' +
-      (a.id === repositoryAccount ? " selected" : "") + '>' + esc(a.login + " (" + a.host + ")") + '</option>').join("") +
-    '</select></div><label for="repository-search">Find a repository</label><div class="field"><input id="repository-search" type="search" autocomplete="off" value="' +
+    '<label for="repository-account">GitHub account</label><div class="field">' +
+    choiceDropdown("repository-account", account ? "GitHub account: " + account.login + " (" + account.host + ")" : "Choose an account",
+      account ? avatarStack([account], 40) + '<span class="name">' + esc(account.login) + '</span>' : '<span class="name">Choose an account</span>',
+      accounts.map(a => ({
+        id: a.id, selected: a.id === repositoryAccount,
+        content: avatarStack([a], 40) + '<span class="choice-text"><span class="choice-name">' + esc(a.login) +
+          '</span><span class="meta">' + esc(a.host) + '</span></span>',
+      })), "account-choice", repositorySaving) +
+    '</div><label for="repository-search">Find a repository</label><div class="field"><input id="repository-search" type="search" autocomplete="off" value="' +
     esc(repositoryQuery) + '" placeholder="Search or enter owner/repo"' + (!repositoryAccount ? " disabled" : "") +
     ' /></div><div id="repository-results">' + repositoryResultsHtml() + '</div>' +
     '<div class="row-actions"><button class="btn" type="button" id="repository-add"' +
@@ -284,15 +329,15 @@ function wireRepositoryResults() {
     button.addEventListener("click", () => mutateRepository("add", button.dataset.repositoryAdd)));
 }
 function wireRepositories() {
-  const manage = document.getElementById("repositories-btn");
+  wireChoiceDropdown("repositories-btn", selectRepository);
+  wireChoiceDropdown("repository-account", id => {
+    scheduleRepositorySearch(id, repositoryQuery);
+    render();
+  });
+  const manage = document.getElementById("manage-repositories-btn");
   if (manage) manage.addEventListener("click", () => goView(view === "repositories" ? "queue" : "repositories"));
   const accounts = document.getElementById("repository-accounts");
   if (accounts) accounts.addEventListener("click", () => goView("accounts"));
-  const account = document.getElementById("repository-account");
-  if (account) account.addEventListener("change", () => {
-    scheduleRepositorySearch(account.value, repositoryQuery);
-    render();
-  });
   const search = document.getElementById("repository-search");
   if (search) search.addEventListener("input", () => scheduleRepositorySearch(repositoryAccount, search.value));
   const add = document.getElementById("repository-add");
@@ -302,6 +347,36 @@ function wireRepositories() {
   document.querySelectorAll("[data-repository-remove]").forEach(button =>
     button.addEventListener("click", () => mutateRepository("remove", button.dataset.repositoryRemove)));
   wireRepositoryResults();
+}
+function wireChoiceDropdown(id, onSelect) {
+  const trigger = document.getElementById(id);
+  const menu = document.getElementById(id + "-menu");
+  if (!trigger || !menu) return;
+  const open = last => {
+    closeCbMenus();
+    openCbMenu(trigger.parentElement, trigger, menu);
+    const items = [...menu.querySelectorAll(".choice-item")];
+    const selected = items.find(item => item.getAttribute("aria-checked") === "true");
+    (last ? items.at(-1) : selected || items[0])?.focus();
+  };
+  trigger.addEventListener("click", event => {
+    event.stopPropagation();
+    if (menu.hidden) open(false);
+    else closeCbMenus();
+  });
+  trigger.addEventListener("keydown", event => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      open(event.key === "ArrowUp");
+    }
+  });
+  wireMenuKeyboard(menu, trigger);
+  menu.querySelectorAll(".choice-item").forEach(item => item.addEventListener("click", event => {
+    event.stopPropagation();
+    closeCbMenus();
+    onSelect(item.dataset.choice);
+    document.getElementById(id)?.focus();
+  }));
 }
 function autoApplyEnabled() {
   return !prefs || prefs.autoApplyUpdates !== false;
@@ -350,6 +425,7 @@ const ICONS = {
   check: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>',
   x: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18"/><path d="M6 6l12 12"/></svg>',
   plus: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>',
+  repo: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20M6.5 3H20v19H6.5A2.5 2.5 0 0 1 4 19.5v-14A2.5 2.5 0 0 1 6.5 3Z"/><path d="M8 7h8M8 11h6"/></svg>',
   pencil: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
   trash: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
   users: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
@@ -411,6 +487,10 @@ function cssEsc(s) { return (window.CSS && CSS.escape) ? CSS.escape(s) : String(
 const FALLBACK_AVATAR = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0MCIgaGVpZ2h0PSI0MCIgdmlld0JveD0iMCAwIDQwIDQwIj48cmVjdCB3aWR0aD0iNDAiIGhlaWdodD0iNDAiIHJ4PSIyMCIgZmlsbD0iIzMwMzYzZCIvPjxjaXJjbGUgY3g9IjIwIiBjeT0iMTUuNSIgcj0iNi41IiBmaWxsPSIjOGI5NDllIi8+PHBhdGggZD0iTTguNSAzMy41YzAtNi40IDUuMi0xMC41IDExLjUtMTAuNXMxMS41IDQuMSAxMS41IDEwLjV6IiBmaWxsPSIjOGI5NDllIi8+PC9zdmc+";
 document.addEventListener("error", (event) => {
   const image = event.target;
+  if (image?.tagName === "IMG" && image.hasAttribute("data-repository-avatar")) {
+    image.remove();
+    return;
+  }
   if (image && image.tagName === "IMG" && image.hasAttribute("data-fallback-avatar")) {
     image.removeAttribute("data-fallback-avatar");
     image.src = FALLBACK_AVATAR;
@@ -1517,6 +1597,9 @@ function openCbMenu(split, caret, menu) {
   // more room up top.
   let top = caretRect.bottom + 5;
   if (top + mh > vh - pad && caretRect.top - mh - 5 > pad) top = caretRect.top - mh - 5;
+  if (menu.classList.contains("choice-menu")) {
+    top = Math.max(pad, Math.min(top, vh - mh - pad));
+  }
 
   menu.style.left = Math.round(left) + "px";
   menu.style.top = Math.round(top) + "px";
@@ -1529,6 +1612,26 @@ function openCbMenu(split, caret, menu) {
   menu.__ownerCaret = caret;
   const firstItem = menu.querySelector(".cb-menu-item");
   if (firstItem && typeof firstItem.focus === "function") firstItem.focus();
+}
+
+function wireMenuKeyboard(menu, caret) {
+  menu.addEventListener("keydown", e => {
+    const items = Array.from(menu.querySelectorAll(".cb-menu-item"));
+    if (!items.length) return;
+    const i = items.indexOf(document.activeElement);
+    if (e.key === "ArrowDown") { e.preventDefault(); items[(i + 1 + items.length) % items.length].focus(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); items[(i - 1 + items.length) % items.length].focus(); }
+    else if (e.key === "Home") { e.preventDefault(); items[0].focus(); }
+    else if (e.key === "End") { e.preventDefault(); items[items.length - 1].focus(); }
+    else if (e.key === "Escape") { e.preventDefault(); closeCbMenus(); caret.focus(); }
+    else if (e.key === "Tab") { closeCbMenus(); caret.focus(); }
+    else if (e.key.length === 1 && /\S/.test(e.key) && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      const ordered = [...items.slice(i + 1), ...items.slice(0, i + 1)];
+      const match = ordered.find(item => (item.querySelector(".choice-name")?.textContent || item.textContent).trim().toLowerCase().startsWith(e.key.toLowerCase()));
+      if (match) { e.preventDefault(); match.focus(); }
+    } else return;
+    e.stopPropagation();
+  });
 }
 
 async function saveSettings() {
@@ -1753,6 +1856,7 @@ function restoreNotifs() {
 /* ---- navigation ---- */
 
 function goView(next, forward) {
+  if (next === "repositories" && view !== "repositories") repositoryAccount = "";
   if ((view === "accounts" || view === "repositories") && next !== "accounts" && next !== "repositories" && accountScanController) {
     ++accountScanGeneration;
     accountScanController.abort();
@@ -2546,7 +2650,7 @@ function healthView() {
 
 function queueView() {
   if (prefs && Object.hasOwn(prefs, "selectedRepository") && !prefs.selectedRepository) {
-    return '<div class="state"><div class="ico">' + ICONS.layers + '</div><h2>Choose a repository</h2><p>Use the Repositories button to add or select a repository.</p></div>';
+    return '<div class="state"><div class="ico">' + ICONS.layers + '</div><h2>Choose a repository</h2><p>Use the repository dropdown to select a repository, or its cog to add one.</p></div>';
   }
   if (state.cacheStatus === "loading" || state.cacheStatus === "empty") {
     return '<div class="state" role="status"><div class="ico">' + ICONS.refresh +
@@ -3177,17 +3281,7 @@ function wire() {
     // re-anchors focus on the in-flow caret (so focus never lands in the portaled-away <body>),
     // but does not preventDefault, so the browser's native Tab then advances focus to the next
     // element per the pattern. Enter/Space activate natively (buttons).
-    if (caret && menu) menu.addEventListener("keydown", (e) => {
-      const items = Array.prototype.slice.call(menu.querySelectorAll(".cb-menu-item"));
-      if (!items.length) return;
-      const i = items.indexOf(document.activeElement);
-      if (e.key === "ArrowDown") { e.preventDefault(); items[(i + 1 + items.length) % items.length].focus(); }
-      else if (e.key === "ArrowUp") { e.preventDefault(); items[(i - 1 + items.length) % items.length].focus(); }
-      else if (e.key === "Home") { e.preventDefault(); items[0].focus(); }
-      else if (e.key === "End") { e.preventDefault(); items[items.length - 1].focus(); }
-      else if (e.key === "Escape") { e.preventDefault(); closeCbMenus(); caret.focus(); }
-      else if (e.key === "Tab") { closeCbMenus(); caret.focus(); }
-    });
+    if (caret && menu) wireMenuKeyboard(menu, caret);
     split.querySelectorAll(".cb-menu-item").forEach((mi) =>
       mi.addEventListener("click", (e) => {
         e.preventDefault(); e.stopPropagation();
@@ -3205,7 +3299,14 @@ function wire() {
     // A fixed menu doesn't track the caret once the page scrolls or the window resizes,
     // so dismiss rather than let it drift away from its button. Capture-phase scroll on
     // the document catches scrolling inside any nested container, not just the window.
-    document.addEventListener("scroll", () => closeCbMenus(), true);
+    document.addEventListener("scroll", (event) => {
+      if (!event.target.closest?.(".cb-menu")) closeCbMenus();
+    }, true);
+    document.addEventListener("focusin", (event) => {
+      document.querySelectorAll(".choice-menu").forEach(menu => {
+        if (!menu.hidden && !menu.contains(event.target) && menu.__ownerCaret !== event.target) closeCbMenus();
+      });
+    });
     if (typeof window !== "undefined" && window.addEventListener) {
       window.addEventListener("resize", () => closeCbMenus());
     }

@@ -48,18 +48,23 @@ confirmation before creating a session. Copilot CLI session launching is deferre
 
 ## Repositories and accounts
 
-Click the single repository button in the header to open the repository
-management page. Search GitHub using a detected account, or enter an
+Use the repository dropdown in the header to switch dashboards. It shows each
+repository's name and its GitHub owner avatar, with a generic repository icon
+when no image is available. The cog beside it opens the compact repository
+management list. Search GitHub using a detected account, or enter an
 `OWNER/REPO` name and save it. Search uses the selected account's GitHub host,
 including GitHub Enterprise Server (GHES); arbitrary API URLs are not accepted.
 The account must already be authenticated through GitHub CLI or a supported
 environment credential. **Accounts** manages credentials separately from the
 saved repository list.
 
-Select a saved repository row to open its dashboard. The header button shows
-the selected repository's name; click it again to return to repository
-management. Opening the already selected repository returns to its dashboard
-without changing the selection or starting another sync.
+Select a saved repository row to open its dashboard. Opening the already
+selected repository returns to its dashboard without changing the selection
+or starting another sync. The management page's account dropdown uses the same
+avatars and names as the header and initially selects the current repository's
+account (otherwise an active account or the first available credential).
+Both dropdowns support arrow keys, Home/End, first-letter navigation, and
+Escape to close; Tab continues to the next control.
 
 Review, Issues, Ship, and Health show **one repository at a time**.
 Counts, notifications, actions, and refreshes belong to

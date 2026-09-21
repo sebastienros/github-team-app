@@ -169,9 +169,15 @@ and are rebuilt. ETags are not required.
 
 Successful dashboard data is cached on disk. Startup and project/view switching
 read the matching cache immediately, without waiting for authentication or
-network discovery, then refresh in the background. The UI indicates loading,
-refreshing, freshness, and errors. A failed refresh retains the last complete
-matching snapshot. Late responses cannot replace a different selected project,
+network discovery, then refresh in the background. Sync progress appears in a
+floating popup without moving the dashboard. Completion and data-freshness messages
+automatically close after six seconds; hovering or focusing a popup pauses its
+timeout. The limited-window notice and refresh errors also appear in **Notifications**
+with **Change limit** and **Retry** actions, and remain there until resolved or
+dismissed. Closing their popup does not dismiss the notification. These notices
+follow the displayed repository and view; routine success messages do not fill
+the notifications list. A failed refresh retains the last complete matching
+snapshot. Late responses cannot replace a different selected project,
 and actions are resolved against the browser's current canonical snapshot.
 
 The separate rendered cache is scoped by canonical host/repository, assigned account, view, and

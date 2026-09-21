@@ -77,8 +77,19 @@ select, textarea {
 textarea { width: 100%; resize: vertical; }
 .field label { display: block; margin-bottom: 4px; }
 .brand .mark { color: var(--cp-accent); }
-.freshness { padding: 8px 16px; color: var(--cp-text-muted); border-bottom: 1px solid var(--cp-border); }
-.item-limit-notice { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 16px; padding: 8px 16px; color: var(--cp-text-muted); border-bottom: 1px solid var(--cp-border); }
+.status-popups {
+  position: fixed; right: 16px; bottom: 16px; z-index: 50;
+  width: min(420px, calc(100vw - 32px)); max-height: calc(100vh - 80px);
+  overflow-y: auto; pointer-events: none;
+}
+#toast-list { display: flex; flex-direction: column; gap: 8px; }
+.status-popups .notif-card, .sync-progress {
+  pointer-events: auto; background: var(--cp-surface);
+  border: 1px solid var(--cp-border); border-radius: var(--radius);
+  box-shadow: 0 2px 8px var(--cp-highlight);
+}
+.notice-action { margin-top: 8px; }
+.badge[hidden] { display: none; }
 .repository-results { list-style: none; padding: 0; margin: 12px 0; }
 .repository-result { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 16px 0; border-bottom: 1px solid var(--cp-border); }
 .repository-result > div:first-child { flex: 1; min-width: 160px; overflow-wrap: anywhere; }
@@ -107,11 +118,10 @@ textarea { width: 100%; resize: vertical; }
   animation: syncPending 1.8s linear infinite;
 }
 .sync-progress {
-  padding: 8px 16px; border-bottom: 1px solid var(--cp-border);
-  background: var(--cp-bg-elevated); color: var(--cp-text-muted);
+  padding: 12px 16px; margin-bottom: 8px; color: var(--cp-text-muted);
 }
 .sync-progress[hidden], .sync-progress progress[hidden] { display: none; }
-.sync-progress.initial { padding: 20px; background: var(--cp-accent-soft); }
+.sync-progress.initial { padding: 16px; }
 .sync-progress.initial [role="status"] { color: var(--cp-text); font-size: 15px; font-weight: 600; }
 .sync-progress.failed { color: var(--cp-danger); }
 .sync-progress-detail { margin: 4px 0 0; }
@@ -842,6 +852,7 @@ button.brand:focus-visible { outline: 2px solid var(--cp-accent); outline-offset
 }
 .notif-card:hover { border-color: var(--cp-border-strong); background: var(--cp-bg-elevated); }
 .notif-card.removing { opacity: 0; transform: translateX(14px); max-height: 0; padding-top: 0; padding-bottom: 0; margin-top: -8px; }
+.notif-card.status-notice { max-height: none; transition: border-color .15s; }
 .notif-card .ndot { margin-top: 5px; width: 8px; height: 8px; border-radius: 50%; flex: none; }
 .notif-card .nbody { min-width: 0; flex: 1; }
 .notif-card .ntitle { display: block; font-size: 13px; font-weight: 600; overflow-wrap: anywhere; word-break: break-word; }

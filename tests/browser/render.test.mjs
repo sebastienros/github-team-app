@@ -57,7 +57,7 @@ test("render keeps the current dashboard visible and surfaces later load errors"
   api.setLoadError("GitHub API 500 unavailable");
   api.render();
 
-  assert.match(app.innerHTML, /GitHub API 500 unavailable/);
+  assert.equal(api.activeNotifications()[0].detail, "GitHub API 500 unavailable");
   assert.match(app.innerHTML, /GitHub accounts/);
 });
 
@@ -1009,7 +1009,7 @@ test("Health order rolls back when persistence fails", async () => {
   await api.commitHealthOrder([second, first], [first, second], second.id);
 
   assert.deepEqual(JSON.parse(JSON.stringify(api.getState().health.items)), [first, second]);
-  assert.match(app.innerHTML, /Preferences are read-only/);
+  assert.equal(api.activeNotifications()[0].detail, "Preferences are read-only");
 });
 
 test("Health group reordering persists every related source as one contiguous unit", async () => {
@@ -1415,7 +1415,7 @@ test("empty selection cannot clear the repository button or contradict its dashb
   assert.equal(api.getState(), dashboard);
   assert.equal(api.getPrefs(), preferences);
   assert.match(app.innerHTML, /<span class="name">Octo\/Alpha<\/span>/);
-  assert.match(app.innerHTML, /Choose a repository from the list/);
+  assert.equal(api.activeNotifications()[0].detail, "Choose a repository from the list.");
   assert.ok(!requests.includes("api/repositories/select"));
 });
 
@@ -1455,7 +1455,7 @@ test("repository chip opens management, selecting opens the dashboard, and the n
   assert.match(app.innerHTML, /Team\/Beta \(ghe.example.com\) - Select and manage repositories/);
   selected.resolve(jsonResponse(repositoryPayload(repositoryB, 2)));
   await selecting;
-  assert.match(app.innerHTML, /Cached data/);
+  assert.equal(api.getState().cacheStatus, "cached");
   handlers.chip();
   assert.match(app.innerHTML, /<h2>Repositories<\/h2>/);
   assert.match(app.innerHTML, /data-repository-select="ghe.example.com\/team\/beta">Open selected/);
@@ -1478,9 +1478,9 @@ test("repository switching clears old content immediately, applies cache, then a
   request.resolve(jsonResponse(repositoryPayload(repositoryB, 2)));
   await selecting;
   assert.equal(api.getState().marker, repositoryB.repository);
-  assert.match(app.innerHTML, /Cached data/);
+  assert.equal(api.getState().cacheStatus, "cached");
   api.applyPushedState(repositoryPayload(repositoryB, 3, { cacheStatus: "live", refreshing: false }));
-  assert.match(app.innerHTML, /Live data/);
+  assert.equal(api.getState().cacheStatus, "live");
   assert.doesNotMatch(app.innerHTML, /Refreshing\.\.\./);
 });
 
@@ -1494,7 +1494,7 @@ test("opening the current repository returns to its cached dashboard without sta
   api.setView("repositories");
   await api.selectRepository(repositoryA.id);
   assert.equal(api.getState(), dashboard);
-  assert.match(app.innerHTML, /Cached data/);
+  assert.equal(api.getState().cacheStatus, "cached");
   assert.doesNotMatch(app.innerHTML, /<h2>Repositories<\/h2>/);
   assert.ok(!requests.includes("api/repositories/select"));
 });
@@ -1602,13 +1602,13 @@ test("failed selection surfaces an error without restoring the previous reposito
   });
   seedRepository(api);
   await api.selectRepository(repositoryB.id);
-  assert.match(app.innerHTML, /Could not select repository: Access denied/);
+  assert.equal(api.activeNotifications()[0].detail, "Could not select repository: Access denied");
   assert.equal(api.getState().repositoryId, repositoryB.id);
   assert.equal(api.getState().refreshing, false);
   assert.equal(api.getState().marker, undefined);
 });
 
-test("cached content remains visible alongside freshness and refresh errors", () => {
+test("cached content remains visible and refresh errors are available in Notifications", () => {
   const { app, api } = createRendererHarness();
   const data = repositoryPayload(repositoryA, 1, {
     refreshError: "GitHub rate limit <exceeded>",
@@ -1618,8 +1618,10 @@ test("cached content remains visible alongside freshness and refresh errors", ()
   api.setPrefs(data.prefs);
   api.render();
   assert.match(app.innerHTML, /Retained result/);
-  assert.match(app.innerHTML, /Cached data.*Updated.*Refreshing/);
-  assert.match(app.innerHTML, /Refresh failed: GitHub rate limit &lt;exceeded&gt;/);
+  assert.equal(api.activeNotifications()[0].detail, "GitHub rate limit <exceeded>");
+  api.goView("notifications");
+  assert.match(app.innerHTML, /Refresh failed/);
+  assert.match(app.innerHTML, /GitHub rate limit &lt;exceeded&gt;/);
 });
 
 test("empty startup reports no repository selected instead of loading, including unauthenticated views", () => {
@@ -1633,7 +1635,7 @@ test("empty startup reports no repository selected instead of loading, including
         api.setState(data.dashboard);
         api.setPrefs(data.prefs);
         api.render();
-        assert.match(app.innerHTML, /class="freshness" role="status">No repository selected<\/div>/);
+        assert.match(app.innerHTML, authenticated || mode === "health" ? /Choose a repository/ : /Enable a GitHub account/);
         assert.doesNotMatch(app.innerHTML, /Loading data|Loading repository|Refreshing\.\.\.|Updated null/);
         assert.match(app.innerHTML, /id="repositories-btn"/);
       }
@@ -1649,7 +1651,7 @@ test("selected repository with no cache and no active request does not claim to 
   api.setState(data.dashboard);
   api.setPrefs(data.prefs);
   api.render();
-  assert.match(app.innerHTML, /class="freshness" role="status">No data available<\/div>/);
+  assert.match(app.innerHTML, /Repository data unavailable/);
   assert.doesNotMatch(app.innerHTML, /Loading data/);
 });
 
@@ -1802,23 +1804,145 @@ test("invalid open-item limits leave Settings and its draft intact without a req
   }
 });
 
-test("limited repository windows show their scope and link to Settings without warning on Health", () => {
-  const handlers = {};
-  const { app, api } = createRendererHarness({
-    elements: { "item-limit-settings": { addEventListener(event, handler) { handlers.settings = handler; } } },
-  });
+test("limited repository windows retain their scope and Settings action in Notifications", () => {
+  const { app, api } = createRendererHarness();
   seedRepository(api);
   api.setState({ ...api.getState(), mode: "issues", itemScope: { limit: 200, loaded: 200, totalOpen: 9500, limited: true } });
   api.render();
+  const [notice] = api.activeNotifications();
+  assert.equal(notice.detail, "Loaded 200 of 9500 open issues, most recently updated first. Limit: 200. Counts and lanes use this limited set.");
+  assert.equal(notice.actionLabel, "Change limit");
+  api.goView("notifications");
   assert.match(app.innerHTML, /Loaded 200 of 9500 open issues, most recently updated first. Limit: 200/);
   assert.match(app.innerHTML, /Counts and lanes use this limited set/);
-  handlers.settings();
+  api.noticeAction(notice.action);
   assert.match(app.innerHTML, /<h2>Settings<\/h2>/);
-  assert.doesNotMatch(app.innerHTML, /Loaded 200 of 9500/);
+  assert.equal(api.activeNotifications().length, 1);
   api.setView("queue");
   api.setState({ ...api.getState(), mode: "health" });
   api.render();
-  assert.doesNotMatch(app.innerHTML, /Loaded 200 of 9500/);
+  assert.equal(api.activeNotifications().length, 0);
+});
+
+test("status popups expire after six seconds without changing the board or losing persistent notices", () => {
+  const timers = new Map();
+  let nextTimer = 0;
+  const { app, api } = createRendererHarness({
+    fetch: () => new Promise(() => {}),
+    setTimeout(callback, delay) { timers.set(++nextTimer, { callback, delay }); return nextTimer; },
+    clearTimeout(id) { timers.delete(id); },
+  });
+  seedRepository(api);
+  api.setState({
+    ...api.getState(), mode: "issues", cacheStatus: "live", refreshing: false,
+    itemScope: { limit: 200, loaded: 200, totalOpen: 263, limited: true },
+  });
+  api.render();
+  const board = app.innerHTML;
+  assert.deepEqual(Array.from(api.getToasts(), n => n.title), ["Repository window is limited", "Live data"]);
+  assert.deepEqual([...timers.values()].map(t => t.delay), [6000, 6000]);
+  for (const { callback } of [...timers.values()]) callback();
+  assert.equal(api.getToasts().length, 0);
+  assert.equal(app.innerHTML, board);
+  assert.deepEqual(Array.from(api.activeNotifications(), n => n.title), ["Repository window is limited"]);
+  api.render();
+  assert.equal(app.innerHTML, board);
+  assert.equal(api.getToasts().length, 0, "rendering the same status must not reopen its popup");
+  api.goView("notifications");
+  assert.match(app.innerHTML, /Loaded 200 of 263 open issues/);
+  assert.match(app.innerHTML, /data-notice-action="settings">Change limit/);
+});
+
+test("closing, dismissing, restoring and clearing status notices leave server notifications independent", async () => {
+  const requests = [];
+  const { api } = createRendererHarness({
+    fetch: path => { requests.push(path); return new Promise(() => {}); },
+    setTimeout: () => 1,
+  });
+  seedRepository(api);
+  api.setState({
+    ...api.getState(), mode: "review",
+    itemScope: { limit: 200, loaded: 200, totalOpen: 263, limited: true },
+  });
+  api.render();
+  const [notice] = api.activeNotifications();
+  api.hideToast(notice.id);
+  assert.equal(api.activeNotifications().length, 1);
+  api.dismissNotif(notice.id);
+  assert.equal(api.activeNotifications().length, 0);
+  assert.equal(api.dismissedNotificationCount(), 1);
+  api.updateStatusNotices();
+  assert.equal(api.activeNotifications().length, 0);
+  api.restoreNotifs();
+  assert.equal(api.activeNotifications().length, 1);
+  assert.equal(api.dismissedNotificationCount(), 0);
+  assert.equal(api.getToasts().filter(n => n.persistent).length, 0);
+  await api.dismissAll();
+  assert.equal(api.activeNotifications().length, 0);
+  assert.deepEqual(requests, ["api/state"]);
+  const prNotice = { id: "pr:42", title: "Review requested" };
+  api.setState({ ...api.getState(), notifications: [prNotice] });
+  assert.deepEqual(Array.from(api.activeNotifications()), [prNotice]);
+});
+
+test("status popups and dismissals reset on resolution and repository changes", () => {
+  const { api } = createRendererHarness({ fetch: () => new Promise(() => {}), setTimeout: () => 1 });
+  seedRepository(api);
+  api.setState({ ...api.getState(), refreshError: "Provider unavailable" });
+  api.render();
+  const [failure] = api.activeNotifications();
+  assert.equal(failure.action, "refresh");
+  api.dismissNotif(failure.id);
+  api.setState({ ...api.getState(), refreshError: null, cacheStatus: "live" });
+  api.render();
+  assert.equal(api.activeNotifications().length, 0);
+  api.setState({ ...api.getState(), refreshError: "Provider unavailable" });
+  api.render();
+  assert.equal(api.activeNotifications()[0].detail, "Provider unavailable");
+  assert.deepEqual(Array.from(api.getToasts(), n => n.title), ["Refresh failed"]);
+  seedRepository(api, repositoryB);
+  api.render();
+  assert.equal(api.activeNotifications().length, 0);
+  assert.deepEqual(Array.from(api.getToasts(), n => n.title), ["Cached data"]);
+});
+
+test("completion hides sync progress and emits a single temporary success popup without replacing a form", () => {
+  const timers = new Map();
+  let nextTimer = 0;
+  const h = syncHarness({
+    setTimeout(callback, delay) { timers.set(++nextTimer, { callback, delay }); return nextTimer; },
+    clearTimeout(id) { timers.delete(id); },
+  });
+  seedRepository(h.api);
+  h.api.setView("settings");
+  h.api.render();
+  const form = h.app.innerHTML;
+  h.emit("progress", syncTick({ initial: false }));
+  assert.equal(h.section.hidden, false);
+  const terminal = syncTick({ initial: false, revision: 2, complete: true, phase: "complete" });
+  h.emit("progress", terminal);
+  assert.equal(h.section.hidden, true);
+  assert.deepEqual(Array.from(h.api.getToasts(), n => n.title), ["Repository sync: Sync complete"]);
+  assert.equal(h.api.activeNotifications().length, 0);
+  assert.equal(h.app.innerHTML, form);
+  for (const { callback, delay } of [...timers.values()]) if (delay === 6000) callback();
+  h.emit("progress", terminal);
+  h.api.renderSyncProgress();
+  assert.equal(h.api.getToasts().length, 0);
+  assert.equal(h.section.hidden, true);
+  assert.equal(h.elements["release-input"].value, "unsaved release");
+});
+
+test("notification markup escapes provider messages and preserves the action", () => {
+  const { api } = createRendererHarness();
+  const html = api.statusNoticeHtml({
+    id: 'status:error:"quoted"', title: "<script>bad</script>", detail: 'A & B < C',
+    tone: "danger", action: "refresh", actionLabel: "Retry", persistent: true,
+  });
+  assert.match(html, /&lt;script&gt;bad&lt;\/script&gt;/);
+  assert.match(html, /A &amp; B &lt; C/);
+  assert.match(html, /data-dismiss="status:error:&quot;quoted&quot;"/);
+  assert.match(html, /data-notice-action="refresh">Retry/);
 });
 
 test("standalone doctor and session configuration retain their endpoints and generic defaults", async () => {
@@ -2040,6 +2164,9 @@ function createRendererHarness(overrides = {}) {
 
   vm.runInNewContext(`Object.assign(__test, {
     onProgress, setMode, renderSyncProgress,
+    activeNotifications, dismissedNotificationCount, noticeAction, statusNoticeHtml,
+    updateStatusNotices, dismissNotif, dismissAll, restoreNotifs, hideToast,
+    getToasts() { return [...statusToasts.values()]; },
     getProgress() { return syncProgress; },
     isSyncActive() { return syncActive; }
   });`, sandbox);
@@ -2515,7 +2642,7 @@ test("a cache warning or previous refresh error does not terminate an active ret
     assert.equal(h.loadbar.classList.contains("active"), true);
     assert.equal(h.section.classList.contains("failed"), false);
     assert.equal(h.api.getState().refreshError, warning);
-    assert.ok(h.app.innerHTML.includes(warning), "the retained warning remains visible");
+    assert.equal(h.api.activeNotifications()[0].detail, warning, "the retained warning remains in Notifications");
     h.emit("snapshot", {
       repositoryId: repositoryA.id, mode: "health", seq: 4, refreshing: true,
       refreshError: warning, prefs: pending.prefs,
@@ -2663,8 +2790,8 @@ test("terminal sync progress ends unchanged-data refreshes with Auto disabled", 
 });
 
 test("progress styling uses the existing theme, polite native progress semantics and reduced motion", () => {
-  assert.match(APP_JS, /id="sync-progress-status" role="status" aria-live="polite" aria-atomic="true"/);
-  assert.match(APP_JS, /<progress id="sync-progress-bar" aria-label="Repository sync phase"/);
+  assert.match(HTML, /id="sync-progress-status" role="status" aria-live="polite" aria-atomic="true"/);
+  assert.match(HTML, /<progress id="sync-progress-bar" aria-label="Repository sync phase"/);
   assert.doesNotMatch(APP_JS, /"8%"|Math\.max\(8,/);
   assert.match(STYLES, /@media \(prefers-reduced-motion: reduce\)[\s\S]*\.loadbar\.indeterminate, \.sync-progress progress:indeterminate \{ animation: none; \}/);
 });

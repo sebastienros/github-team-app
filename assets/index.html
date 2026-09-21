@@ -39,6 +39,14 @@
         </section>
       </div>
     </div>
+    <aside class="status-popups" aria-label="Status updates">
+      <section id="sync-progress" class="sync-progress" hidden aria-label="Repository synchronization">
+        <div id="sync-progress-status" role="status" aria-live="polite" aria-atomic="true"></div>
+        <progress id="sync-progress-bar" aria-label="Repository sync phase"></progress>
+        <p id="sync-progress-detail" class="sync-progress-detail"></p>
+      </section>
+      <div id="toast-list" aria-live="polite" aria-relevant="additions"></div>
+    </aside>
     <script src="app.js"></script>
   </body>
 </html>

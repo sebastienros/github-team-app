@@ -127,12 +127,12 @@ async function selectRepository(id) {
   selectionPending = true;
   prefs = { ...(prefs || {}), selectedRepository: id };
   state = emptyDashboard(id);
+  loadError = null;
   resetSyncProgress();
   syncFromDashboard(state);
   pendingState = null;
   updateAvailable = null;
   lastAppliedSeq = -1;
-  loadError = null;
   cancelRepositorySearch();
   goView("queue", false);
   // Serialize writes as well as guarding reads: the persisted selection must finish on B,
@@ -646,12 +646,6 @@ function finishSyncProgress(error) {
   endProgress(!!error);
   renderSyncProgress();
 }
-function syncProgressHtml() {
-  return '<section id="sync-progress" class="sync-progress" hidden aria-label="Repository synchronization">' +
-    '<div id="sync-progress-status" role="status" aria-live="polite" aria-atomic="true"></div>' +
-    '<progress id="sync-progress-bar" aria-label="Repository sync phase"></progress>' +
-    '<p id="sync-progress-detail" class="sync-progress-detail"></p></section>';
-}
 function renderSyncProgress() {
   const section = document.getElementById("sync-progress");
   const status = document.getElementById("sync-progress-status");
@@ -670,7 +664,7 @@ function renderSyncProgress() {
   // present a full overall bar before the completed dashboard is committed.
   const determinate = known && p.total > 0 && p.done < p.total;
   if (section) {
-    section.hidden = !syncActive && !p && !syncError;
+    section.hidden = !syncActive;
     section.classList.toggle("initial", !!initial && syncActive);
     section.classList.toggle("failed", !!syncError);
   }
@@ -700,6 +694,7 @@ function renderSyncProgress() {
     loadbar.classList.toggle("indeterminate", !determinate);
     loadbar.style.width = determinate ? (p.done / p.total * 100) + "%" : "100%";
   }
+  updateStatusNotices();
 }
 function clearProgressTimers() {
   if (progFadeTimer) { clearTimeout(progFadeTimer); progFadeTimer = null; }
@@ -1592,13 +1587,168 @@ async function rescanAccounts() {
   }
 }
 
+// Status notices belong to the displayed repository/view, not the pending snapshot.
+// Keeping their popup host outside #app lets timers and stream events leave forms alone.
+const seenStatusNotices = new Set();
+const dismissedStatusNotices = new Set();
+const statusToasts = new Map();
+const toastTimers = new Map();
+const notificationMarkup = new WeakMap();
+let statusNoticeScope = "";
+const TOAST_DURATION = 6000;
+
+function statusNotices() {
+  const notices = [];
+  const error = loadError || syncError || state?.refreshError;
+  if (error) notices.push({
+    id: "status:error:" + error, title: syncError || state?.refreshError ? "Refresh failed" : "Action failed",
+    detail: error, tone: "danger",
+    action: syncError || state?.refreshError ? "refresh" : null, actionLabel: "Retry", persistent: true,
+  });
+  const scope = state?.itemScope;
+  if (state?.mode !== "health" && scope?.limited) notices.push({
+    id: "status:limit:" + scope.limit, title: "Repository window is limited",
+    detail: "Loaded " + scope.loaded + " of " + scope.totalOpen + " open " +
+      (state.mode === "issues" ? "issues" : "PRs") + ", most recently updated first. Limit: " +
+      scope.limit + ". Counts and lanes use this limited set.",
+    tone: "warning", action: "settings", actionLabel: "Change limit", persistent: true,
+  });
+  return notices;
+}
+function activeNotifications() {
+  return [...statusNotices().filter(n => !dismissedStatusNotices.has(n.id)), ...(state?.notifications || [])];
+}
+function dismissedNotificationCount() {
+  return (state?.dismissedCount || 0) + statusNotices().filter(n => dismissedStatusNotices.has(n.id)).length;
+}
+function stopToastTimer(id) {
+  clearTimeout(toastTimers.get(id));
+  toastTimers.delete(id);
+}
+function hideToast(id) {
+  stopToastTimer(id);
+  statusToasts.delete(id);
+  renderToasts();
+}
+function startToastTimer(id) {
+  stopToastTimer(id);
+  toastTimers.set(id, setTimeout(() => hideToast(id), TOAST_DURATION));
+}
+function noticeAction(action) {
+  if (action === "settings") goView("settings");
+  else if (action === "refresh") withRefresh(() => postJSON("api/refresh"));
+}
+function statusNoticeHtml(n, popup = false) {
+  return '<div class="notif-card status-notice"' + (popup ? ' data-toast="' + esc(n.id) + '"' : "") + '>' +
+    '<span class="ndot bg-' + n.tone + '"></span><div class="nbody">' +
+    '<span class="ntitle">' + esc(n.title) + '</span><span class="ndetail">' + esc(n.detail || "") + '</span>' +
+    (n.action ? '<button class="linklike notice-action" type="button" data-notice-action="' + n.action + '">' +
+      esc(n.actionLabel) + '</button>' : "") + '</div><button class="dismiss" type="button" ' +
+    (popup ? 'data-toast-dismiss="' : 'data-dismiss="') + esc(n.id) +
+    '" aria-label="' + (popup ? "Close popup" : "Dismiss") + '">' + ICONS.x + '</button></div>';
+}
+function renderToasts() {
+  const host = document.getElementById("toast-list");
+  if (!host) return;
+  host.querySelectorAll("[data-toast]").forEach(card => {
+    if (!statusToasts.has(card.dataset.toast)) card.remove();
+  });
+  for (const [id, notice] of statusToasts) {
+    if (host.querySelector('[data-toast="' + cssEsc(id) + '"]')) continue;
+    host.insertAdjacentHTML("beforeend", statusNoticeHtml(notice, true));
+    const card = host.lastElementChild;
+    card.querySelector("[data-toast-dismiss]").addEventListener("click", () => hideToast(id));
+    const action = card.querySelector("[data-notice-action]");
+    if (action) action.addEventListener("click", () => noticeAction(action.dataset.noticeAction));
+    card.addEventListener("mouseenter", () => stopToastTimer(id));
+    card.addEventListener("focusin", () => stopToastTimer(id));
+    card.addEventListener("mouseleave", () => {
+      if (!card.contains(document.activeElement)) startToastTimer(id);
+    });
+    card.addEventListener("focusout", event => {
+      if (!card.contains(event.relatedTarget) && !card.matches(":hover")) startToastTimer(id);
+    });
+  }
+}
+function updateStatusNotices() {
+  const scope = JSON.stringify([state?.repositoryId || "", state?.mode || ""]);
+  if (scope !== statusNoticeScope) {
+    for (const id of toastTimers.keys()) stopToastTimer(id);
+    statusToasts.clear();
+    seenStatusNotices.clear();
+    dismissedStatusNotices.clear();
+    statusNoticeScope = scope;
+  }
+  const candidates = statusNotices();
+  const updated = state?.fetchedAt ? "Updated " + timeAgo(state.fetchedAt) : "";
+  const failed = loadError || syncError || state?.refreshError;
+  if (!syncActive && !failed && syncProgress?.complete) {
+    candidates.push({
+      id: "status:sync:" + syncProgress.syncId, title: "Repository sync: Sync complete",
+      detail: state?.cacheStatus === "live" ? "Live data" + (updated ? " \u00b7 " + updated : "") : "", tone: "success",
+    });
+  } else if (!syncActive && !failed && state?.repositoryId && ["cached", "live"].includes(state.cacheStatus)) {
+    candidates.push({
+      id: "status:data:" + state.cacheStatus,
+      title: state.cacheStatus === "cached" ? "Cached data" : "Live data",
+      detail: updated, tone: "muted",
+    });
+  }
+  const currentIds = new Set(candidates.map(n => n.id));
+  for (const id of seenStatusNotices) {
+    // Freshness needs announcing only once per scope, not again after every sync or error.
+    if (!currentIds.has(id) && !id.startsWith("status:data:")) {
+      seenStatusNotices.delete(id);
+      dismissedStatusNotices.delete(id);
+    }
+  }
+  for (const id of statusToasts.keys()) {
+    if (!currentIds.has(id)) { stopToastTimer(id); statusToasts.delete(id); }
+  }
+  for (const notice of candidates) {
+    if (!seenStatusNotices.has(notice.id)) {
+      seenStatusNotices.add(notice.id);
+      statusToasts.set(notice.id, notice);
+      startToastTimer(notice.id);
+    }
+  }
+  renderToasts();
+  const count = activeNotifications().length;
+  const badge = document.getElementById("notification-badge");
+  if (badge) { badge.textContent = String(count); badge.hidden = count === 0; }
+  const bell = document.getElementById("bell-btn");
+  if (bell) bell.setAttribute("aria-label", "Notifications (" + count + " active)");
+  const list = document.getElementById("notification-content");
+  if (list && view === "notifications") {
+    const html = notificationsView();
+    if (notificationMarkup.get(list) !== html) {
+      list.innerHTML = html;
+      notificationMarkup.set(list, html);
+      wireNotifications();
+    }
+  }
+}
 function dismissNotif(id, cardEl) {
+  if (statusNotices().some(n => n.id === id)) {
+    dismissedStatusNotices.add(id);
+    hideToast(id);
+    updateStatusNotices();
+    return;
+  }
   if (cardEl) cardEl.classList.add("removing");
   const go = () => withRefresh(() => postJSON("api/notifications/dismiss", { id }));
   setTimeout(go, 200);
 }
-const dismissAll = () => withRefresh(() => postJSON("api/notifications/dismiss-all"));
-const restoreNotifs = () => withRefresh(() => postJSON("api/notifications/restore"));
+function dismissAll() {
+  for (const n of statusNotices()) { dismissedStatusNotices.add(n.id); hideToast(n.id); }
+  updateStatusNotices();
+  if (state?.notifications?.length) return withRefresh(() => postJSON("api/notifications/dismiss-all"));
+}
+function restoreNotifs() {
+  dismissedStatusNotices.clear();
+  updateStatusNotices();
+  if (state?.dismissedCount) return withRefresh(() => postJSON("api/notifications/restore"));
+}
 
 /* ---- navigation ---- */
 
@@ -2144,7 +2294,7 @@ function accountChip() {
 }
 
 function topbarHtml() {
-  const notifCount = (state && state.notifications || []).length;
+  const notifCount = activeNotifications().length;
   const autoApply = autoApplyEnabled();
   const showUpdate = !!updateAvailable && !autoApply;
   const left = view === "queue"
@@ -2163,8 +2313,8 @@ function topbarHtml() {
       (autoApply ? "Background updates apply automatically" : "Background updates wait until you apply them") +
       '"><span class="status-dot"></span><span class="refresh-label">Auto</span></button>' +
     '<button class="iconbtn ' + (view === "filters" ? "active" : "") + '" id="filters-btn" title="What\u2019s filtered">' + ICONS.funnel + "</button>" +
-    '<button class="iconbtn ' + (view === "notifications" ? "active" : "") + '" id="bell-btn" title="Notifications">' + ICONS.bell +
-      (notifCount ? '<span class="badge">' + notifCount + "</span>" : "") + "</button>" +
+    '<button class="iconbtn ' + (view === "notifications" ? "active" : "") + '" id="bell-btn" title="Notifications" aria-label="Notifications (' + notifCount + ' active)">' + ICONS.bell +
+      '<span class="badge" id="notification-badge"' + (notifCount ? "" : " hidden") + '>' + notifCount + "</span></button>" +
     '<button class="iconbtn ' + (view === "settings" ? "active" : "") + '" id="gear-btn" title="Settings">' + ICONS.gear + "</button>" +
     "</div>";
   return '<div class="topbar" id="topbar">' +
@@ -2398,7 +2548,7 @@ function queueView() {
   if (prefs && Object.hasOwn(prefs, "selectedRepository") && !prefs.selectedRepository) {
     return '<div class="state"><div class="ico">' + ICONS.layers + '</div><h2>Choose a repository</h2><p>Use the Repositories button to add or select a repository.</p></div>';
   }
-  if (state.cacheStatus === "loading") {
+  if (state.cacheStatus === "loading" || state.cacheStatus === "empty") {
     return '<div class="state" role="status"><div class="ico">' + ICONS.refresh +
       '</div><h2>' + (state.loading || state.refreshing ? "Loading repository..." : "Repository data unavailable") +
       '</h2><p>' + (state.refreshing ? "Fetching the selected repository. Cached results will appear when available." : "Use Refresh to try again.") + '</p></div>';
@@ -2737,8 +2887,8 @@ function accountsView() {
 }
 
 function notificationsView() {
-  const items = state.notifications || [];
-  const dismissed = state.dismissedCount || 0;
+  const items = activeNotifications();
+  const dismissed = dismissedNotificationCount();
   let body;
   if (!items.length) {
     body = '<div class="state"><div class="ico">' + ICONS.bellBig + "</div><h2>You're all caught up</h2>" +
@@ -2746,7 +2896,7 @@ function notificationsView() {
       '<div class="state-cta"><button class="btn ghost" id="to-settings">Open settings</button>' +
       (dismissed ? '<button class="btn ghost" id="restore-notifs">Restore ' + dismissed + " dismissed</button>" : "") + "</div></div>";
   } else {
-    body = '<div class="notif-list">' + items.map((n) =>
+    body = '<div class="notif-list">' + items.map((n) => n.persistent ? statusNoticeHtml(n) :
       '<div class="notif-card" data-id="' + esc(n.id) + '">' +
         '<span class="ndot bg-' + (n.tone || "muted") + '"></span>' +
         '<a class="nbody" href="' + esc(n.url) + '" target="_blank" rel="noreferrer">' +
@@ -2785,12 +2935,13 @@ function authPicker() {
 /* ---- render ---- */
 
 function render(forward) {
+  updateStatusNotices();
   app.removeAttribute("aria-busy");
   // Drop any split-button menu we portaled to <body> before rebuilding the subtree, so an
   // open menu never survives a re-render as a detached orphan carrying stale click handlers.
   document.querySelectorAll("body > .cb-menu").forEach((m) => m.remove());
   if (loadError && !state && view === "queue") {
-    app.innerHTML = topbarShell() + syncProgressHtml() +
+    app.innerHTML = topbarShell() +
       '<div class="state"><div class="ico">' + ICONS.alert + '</div><h2>Could not load</h2><p>' + esc(loadError) +
       '</p><div class="state-cta"><button class="btn" id="retry-btn">Try again</button></div></div>';
     const rt = document.getElementById("retry-btn"); if (rt) rt.addEventListener("click", load);
@@ -2799,7 +2950,7 @@ function render(forward) {
     return;
   }
   if (!state && view !== "repositories" && view !== "accounts") {
-    app.innerHTML = topbarHtml() + syncProgressHtml() + '<div class="state" role="status">Loading...</div>';
+    app.innerHTML = topbarHtml() + '<div class="state" role="status">Loading...</div>';
     wire();
     renderSyncProgress();
     return;
@@ -2812,40 +2963,15 @@ function render(forward) {
   else if (view === "settings") inner = settingsView();
   else if (view === "filters") inner = filtersView();
   else if (view === "accounts") inner = accountsView();
-  else if (view === "notifications") inner = notificationsView();
+  else if (view === "notifications") inner = '<div id="notification-content">' + notificationsView() + '</div>';
   else inner = queueView();
 
   const dir = forward === false || (forward === undefined && (RANK[view] || 0) < prevRank) ? "back" : "";
-  // A refresh/rescan that fails after the dashboard already loaded sets loadError
-  // but keeps the last-good state. Surface it as a dismissible banner instead of
-  // discarding the loaded UI (the full-screen "Could not load" state above only
-  // applies to the very first load, when there is no state to preserve).
-  const banner = loadError
-    ? '<div class="errbar loaderr" role="alert">' + esc(loadError) +
-      '<button class="errbar-x" id="load-errbar-dismiss" type="button" title="Dismiss" aria-label="Dismiss">' + ICONS.x + "</button></div>"
-    : "";
   const motionClass = healthOrderSaving ? " no-motion" : "";
-  const noRepository = prefs && Object.hasOwn(prefs, "selectedRepository") && !prefs.selectedRepository;
-  const freshnessLabel = noRepository ? "No repository selected" :
-    state?.cacheStatus === "cached" ? "Cached data" :
-    state?.cacheStatus === "live" ? "Live data" :
-    state?.loading || state?.refreshing ? "Loading data" : "No data available";
-  const freshness = state && (noRepository || state.cacheStatus || state.refreshError)
-    ? '<div class="freshness" role="status">' + esc(freshnessLabel) +
-      (!noRepository && state.fetchedAt && ["cached", "live"].includes(state.cacheStatus) ? " &middot; Updated " + esc(timeAgo(state.fetchedAt)) : "") +
-      (!noRepository && state.refreshing ? " &middot; Refreshing..." : "") + '</div>' +
-      (state.refreshError ? '<div class="errbar" role="alert">Refresh failed: ' + esc(state.refreshError) + '</div>' : "") : "";
-  const itemScope = state?.itemScope;
-  const limitNotice = view === "queue" && state?.mode !== "health" && itemScope?.limited
-    ? '<div class="item-limit-notice" role="note"><span>Loaded ' + esc(itemScope.loaded) + " of " + esc(itemScope.totalOpen) +
-      " open " + (state.mode === "issues" ? "issues" : "PRs") + ", most recently updated first. Limit: " + esc(itemScope.limit) +
-      '. Counts and lanes use this limited set.</span><button class="linklike" id="item-limit-settings" type="button">Change limit</button></div>' : "";
-  app.innerHTML = topbarHtml() + banner + syncProgressHtml() + freshness + limitNotice + '<div class="viewport"><div class="view ' + dir + motionClass + '">' + inner + "</div></div>";
+  app.innerHTML = topbarHtml() + '<div class="viewport"><div class="view ' + dir + motionClass + '">' + inner + "</div></div>";
+  const list = document.getElementById("notification-content");
+  if (list) notificationMarkup.set(list, notificationsView());
   renderSyncProgress();
-  if (banner) {
-    const bx = document.getElementById("load-errbar-dismiss");
-    if (bx) bx.addEventListener("click", function () { loadError = null; render(); });
-  }
   wire();
   updateRefreshControls();
   layoutGrids();
@@ -2953,8 +3079,6 @@ function wire() {
   const acct = document.getElementById("acct-btn"); if (acct) acct.addEventListener("click", () => goView(view === "accounts" ? "queue" : "accounts"));
 
   const save = document.getElementById("save-settings"); if (save) save.addEventListener("click", saveSettings);
-  const itemLimitSettings = document.getElementById("item-limit-settings");
-  if (itemLimitSettings) itemLimitSettings.addEventListener("click", () => goView("settings"));
   const itemLimitInput = document.getElementById("max-open-items");
   if (itemLimitInput) itemLimitInput.addEventListener("input", () => {
     settingsError = "";
@@ -3025,8 +3149,7 @@ function wire() {
       if (nowCollapsed) collapsedLanes.add(id); else collapsedLanes.delete(id);
     }));
 
-  document.querySelectorAll(".dismiss").forEach((b) =>
-    b.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); dismissNotif(b.dataset.dismiss, b.closest(".notif-card")); }));
+  wireNotifications();
 
   // Card action split buttons live in a sibling row of the card link, so stop the click
   // from bubbling to any surrounding handler and never navigate. The main button runs the
@@ -3087,11 +3210,18 @@ function wire() {
       window.addEventListener("resize", () => closeCbMenus());
     }
   }
+  const brandHome = document.getElementById("brand-home"); if (brandHome) brandHome.addEventListener("click", () => goView("queue", false));
+}
+
+function wireNotifications() {
+  document.querySelectorAll("[data-dismiss]").forEach((b) =>
+    b.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); dismissNotif(b.dataset.dismiss, b.closest(".notif-card")); }));
+  document.querySelectorAll("#notification-content [data-notice-action]").forEach(button =>
+    button.addEventListener("click", () => noticeAction(button.dataset.noticeAction)));
   const da = document.getElementById("dismiss-all"); if (da) da.addEventListener("click", dismissAll);
   const r1 = document.getElementById("restore-notifs"); if (r1) r1.addEventListener("click", restoreNotifs);
   const r2 = document.getElementById("restore-notifs2"); if (r2) r2.addEventListener("click", restoreNotifs);
   const ts = document.getElementById("to-settings"); if (ts) ts.addEventListener("click", () => goView("settings"));
-  const brandHome = document.getElementById("brand-home"); if (brandHome) brandHome.addEventListener("click", () => goView("queue", false));
   const notifCfg = document.getElementById("notif-config");
   if (notifCfg) notifCfg.addEventListener("click", () => {
     goView("settings");

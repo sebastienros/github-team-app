@@ -36,7 +36,7 @@ configure_file(app.rc "${CMAKE_CURRENT_BINARY_DIR}/app.rc" @ONLY)
 add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/app.ico"
     COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/create-icon.ps1"
             -Path "${CMAKE_CURRENT_BINARY_DIR}/app.ico"
-    DEPENDS create-icon.ps1
+    DEPENDS create-icon.ps1 "${CMAKE_CURRENT_SOURCE_DIR}/../icons/octo-1024.png"
     VERBATIM)
 add_custom_target(AppIcon DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/app.ico")
 add_executable(GitHubTeamApp WIN32 main.cpp "${CMAKE_CURRENT_BINARY_DIR}/app.rc")
@@ -55,7 +55,7 @@ set_property(TARGET GitHubTeamApp APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_
 target_include_directories(GitHubTeamApp PRIVATE "${webview2_SOURCE_DIR}/build/native/include")
 target_link_libraries(GitHubTeamApp PRIVATE
     "${webview2_SOURCE_DIR}/build/native/${webview2_arch}/WebView2LoaderStatic.lib"
-    user32 gdi32 ole32 oleaut32 shell32 shlwapi version)
+    user32 gdi32 ole32 oleaut32 shell32 shlwapi version dwmapi)
 install(TARGETS GitHubTeamApp RUNTIME DESTINATION .)
 install(FILES "${webview2_SOURCE_DIR}/LICENSE.txt" DESTINATION . RENAME WebView2.LICENSE.txt)
 install(FILES "${webview2_SOURCE_DIR}/NOTICE.txt" DESTINATION . RENAME WebView2.NOTICE.txt)

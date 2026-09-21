@@ -11,6 +11,13 @@ inline void RunPolicyTests()
     const auto require = [](bool condition) {
         if (!condition) throw std::runtime_error("Native desktop policy assertion failed.");
     };
+    require(desktop::AppearanceDark(L"appearance:system:dark") == true);
+    require(desktop::AppearanceDark(L"appearance:system:light") == false);
+    require(desktop::AppearanceDark(L"appearance:dark:dark") == true);
+    require(desktop::AppearanceDark(L"appearance:light:light") == false);
+    for (const auto invalid : { L"appearance:light:dark", L"appearance:dark:light", L"appearance:auto:dark",
+                               L"appearance:system:invalid", L"appearance:dark", L"appearance:dark:dark:extra" })
+        require(!desktop::AppearanceDark(invalid).has_value());
     require(desktop::LoopbackOrigin(L"http://127.0.0.1:5143/") == L"http://127.0.0.1:5143");
     require(desktop::LoopbackOrigin(L"http://127.0.0.1:65535") == L"http://127.0.0.1:65535");
     for (const auto invalid : {

@@ -209,7 +209,7 @@ internal static class Program
                 context.Response.StatusCode = StatusCodes.Status204NoContent;
                 return;
             }
-            if (context.Request.Method == "GET" && path is "/" or "/index.html" or "/app.js" or "/styles.css" or "/theme.js" or "/standalone.js")
+            if (context.Request.Method == "GET" && path is "/" or "/index.html" or "/app.js" or "/styles.css" or "/theme.js" or "/standalone.js" or "/octo.svg" or "/octo-dock.svg")
             {
                 if (path == "/standalone.js")
                 {
@@ -221,7 +221,14 @@ internal static class Program
                 await using var stream = typeof(Program).Assembly.GetManifestResourceStream($"Assets/{asset}")
                     ?? throw new InvalidOperationException($"Missing embedded browser asset: {asset}");
                 context.Response.ContentType = asset.EndsWith(".css", StringComparison.Ordinal) ? "text/css"
-                    : asset.EndsWith(".js", StringComparison.Ordinal) ? "text/javascript" : "text/html";
+                    : asset.EndsWith(".js", StringComparison.Ordinal) ? "text/javascript"
+                    : asset.EndsWith(".svg", StringComparison.Ordinal) ? "image/svg+xml" : "text/html";
+                if (asset == "theme.js")
+                {
+                    var saved = await services.GetRequiredService<PreferenceStore>().ReadAsync(cancellationToken);
+                    var appearance = JsonValue.Create(PreferenceStore.Appearance(saved))!.ToJsonString();
+                    await context.Response.WriteAsync($"window.githubTeamAppearance = {appearance};\n", cancellationToken);
+                }
                 await stream.CopyToAsync(context.Response.Body, cancellationToken);
                 return;
             }
@@ -324,6 +331,20 @@ internal static class Program
                 var prefs = await preferences.UpdateAsync(p => p["autoApplyUpdates"] = autoApply, cancellationToken);
                 await dashboard.PreferencesChangedAsync(cancellationToken);
                 await JsonAsync(context, new JsonObject { ["prefs"] = prefs });
+                return;
+            }
+            if (path == "/api/appearance")
+            {
+                if (!body.ContainsKey("appearance"))
+                {
+                    throw new ArgumentException("appearance is required.");
+                }
+                string appearance;
+                try { appearance = PreferenceStore.Appearance(body); }
+                catch (InvalidDataException error) { throw new ArgumentException(error.Message, error); }
+                var prefs = await preferences.UpdateAsync(p => p["appearance"] = appearance, cancellationToken);
+                await dashboard.PreferencesChangedAsync(cancellationToken);
+                await JsonAsync(context, new JsonObject { ["appearance"] = prefs["appearance"]!.DeepClone() });
                 return;
             }
             if (path == "/api/health/pipeline/add")

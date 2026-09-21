@@ -36,12 +36,211 @@ test("theme honors explicit light/dark selection and falls back to the system", 
   ]) {
     let actual;
     vm.runInNewContext(THEME_JS, {
-      URLSearchParams,
-      window: { location: { search }, matchMedia: () => ({ matches: dark }) },
+      URLSearchParams, Event,
+      window: { dispatchEvent() {}, location: { search }, matchMedia: () => ({ matches: dark, addEventListener() {} }) },
       document: { documentElement: { setAttribute: (key, value) => { assert.equal(key, "data-theme"); actual = value; } } },
     });
     assert.equal(actual, expected);
   }
+});
+
+test("durable appearance wins before render and OS changes affect only System", () => {
+  for (const saved of ["system", "light", "dark"]) {
+    const media = { matches: false, addEventListener(name, handler) { this.change = handler; } };
+    const messages = [];
+    let actual;
+    const window = {
+      dispatchEvent() {},
+      githubTeamAppearance: saved, location: { search: "?clawpilotTheme=dark" }, matchMedia: () => media,
+      chrome: { webview: { postMessage: message => messages.push(message) } },
+    };
+    vm.runInNewContext(THEME_JS, {
+      URLSearchParams, Event, window,
+      document: { documentElement: { setAttribute: (_, value) => { actual = value; } } },
+    });
+    assert.equal(actual, saved === "dark" ? "dark" : "light");
+    assert.equal(window.githubTeamTheme.preference, saved);
+    assert.equal(window.githubTeamTheme.effectiveTheme, actual);
+    media.matches = true;
+    media.change();
+    assert.equal(actual, saved === "light" ? "light" : "dark");
+    window.githubTeamTheme.setPreference("light");
+    media.matches = false;
+    media.change();
+    media.matches = true;
+    media.change();
+    assert.equal(actual, "light");
+    assert.equal(messages.at(-1), "appearance:light:light");
+    window.githubTeamTheme.setPreference("system");
+    assert.equal(actual, "dark");
+    media.matches = false;
+    media.change();
+    assert.equal(actual, "light");
+    assert.throws(() => window.githubTeamTheme.setPreference("invalid"), /Appearance must/);
+    assert.equal(window.githubTeamTheme.preference, "system");
+  }
+});
+
+test("WKWebView uses the OS appearance rather than its overridden window media query", () => {
+  const media = { matches: true, addEventListener(name, handler) { this.change = handler; } };
+  const messages = [];
+  let actual;
+  const window = {
+    dispatchEvent() {},
+    githubTeamAppearance: "dark", githubTeamSystemTheme: "light", location: { search: "" }, matchMedia: () => media,
+    webkit: { messageHandlers: { appearance: { postMessage: message => messages.push(message) } } },
+  };
+  vm.runInNewContext(THEME_JS, {
+    URLSearchParams, Event, window,
+    document: { documentElement: { setAttribute: (_, value) => { actual = value; } } },
+  });
+  assert.equal(actual, "dark");
+  window.githubTeamTheme.setPreference("system");
+  assert.equal(actual, "light", "returning to System must not stick to the overridden dark window");
+  window.githubTeamTheme.setSystemTheme("dark");
+  assert.equal(actual, "dark");
+  window.githubTeamTheme.setPreference("light");
+  window.githubTeamTheme.setSystemTheme("light");
+  window.githubTeamTheme.setSystemTheme("dark");
+  assert.equal(actual, "light");
+  assert.equal(messages.at(-1), "appearance:light:light");
+  window.githubTeamTheme.setPreference("system");
+  assert.equal(actual, "dark");
+  const count = messages.length;
+  media.change();
+  assert.equal(messages.length, count, "native synchronization must not echo in a loop");
+});
+
+test("loading and rendered headers share the currentColor Octo asset and tile favicon", () => {
+  const { app, api } = createRendererHarness();
+  api.setState({ authenticated: false, accounts: [], notifications: [] });
+  api.setPrefs(rendererPrefs());
+  api.render();
+  const mark = '<svg viewBox="0 0 128 128" aria-hidden="true"><use href="octo.svg#octo"></use></svg>';
+  assert.ok(HTML.includes(mark));
+  assert.ok(app.innerHTML.includes(mark));
+  assert.match(HTML, /rel="icon" type="image\/svg\+xml" href="octo-dock.svg"/);
+  assert.match(STYLES, /\.brand \.mark \{[^}]*border-radius: 50%; background: var\(--cp-accent\); color: var\(--cp-surface\)/);
+});
+
+test("Appearance uses labelled switches and disabling System preserves the effective theme", async () => {
+  for (const effectiveTheme of ["light", "dark"]) {
+    const theme = { preference: "system", effectiveTheme, setPreference(value) { this.preference = value; } };
+    const system = { checked: true, addEventListener(name, handler) { this[name] = handler; } };
+    const dark = { checked: false, addEventListener(name, handler) { this[name] = handler; } };
+    const { app, api } = createRendererHarness({
+      window: { githubTeamTheme: theme },
+      elements: { "appearance-system": system, "appearance-dark": dark, "appearance-error": { textContent: "" } },
+      fetch: (path, options) => path === "api/appearance"
+        ? Promise.resolve(jsonResponse(JSON.parse(options.body))) : new Promise(() => {}),
+    });
+    api.setState({ authenticated: false, accounts: [], notifications: [] });
+    api.setPrefs(rendererPrefs());
+    api.setView("settings");
+    api.render();
+    assert.match(app.innerHTML, /role="switch" id="appearance-system" aria-label="Follow system appearance"[^>]* checked/);
+    assert.match(app.innerHTML, /role="switch" id="appearance-dark" aria-label="Dark mode"[^>]* disabled/);
+    assert.doesNotMatch(app.innerHTML, /<select id="appearance"/);
+    assert.equal(dark.checked, effectiveTheme === "dark");
+    assert.equal(dark.disabled, true);
+    system.checked = false;
+    await system.change();
+    assert.equal(theme.preference, effectiveTheme);
+    assert.equal(system.checked, false);
+    assert.equal(dark.checked, effectiveTheme === "dark");
+    assert.equal(dark.disabled, false);
+    system.checked = true;
+    await system.change();
+    assert.equal(theme.preference, "system");
+    assert.equal(system.checked, true);
+    assert.equal(dark.disabled, true);
+  }
+  assert.match(STYLES, /\.switch input:focus-visible \+ \.slider \{ outline:/);
+});
+
+test("manual Dark mode saves immediately without losing form edits or accepting a pending preference echo", async () => {
+  const request = deferred();
+  const theme = { preference: "light", effectiveTheme: "light", setPreference(value) { this.preference = value; this.effectiveTheme = value; } };
+  const system = { checked: false, addEventListener(name, handler) { this[name] = handler; } };
+  const dark = { checked: false, addEventListener(name, handler) { this[name] = handler; } };
+  const error = { textContent: "" };
+  const release = { value: "unsaved-release" };
+  const calls = [];
+  const { app, api } = createRendererHarness({
+    window: { githubTeamTheme: theme },
+    elements: { "appearance-system": system, "appearance-dark": dark, "appearance-error": error, "release-input": release },
+    fetch: (path, options) => {
+      if (path !== "api/appearance") return new Promise(() => {});
+      calls.push(JSON.parse(options.body));
+      return request.promise;
+    },
+  });
+  api.setState({ authenticated: false, accounts: [], notifications: [] });
+  api.setPrefs(rendererPrefs());
+  api.setView("settings");
+  api.render();
+  dark.checked = true;
+  const saving = dark.change();
+  assert.equal(theme.preference, "dark");
+  assert.equal(dark.disabled, true);
+  assert.equal(system.disabled, true);
+  api.onPreferences({ ...rendererPrefs(), appearance: "light" });
+  assert.equal(theme.preference, "dark", "a preference echo must not interrupt the pending selection");
+  request.resolve(jsonResponse({ appearance: "dark" }));
+  await saving;
+  assert.deepEqual(calls, [{ appearance: "dark" }]);
+  assert.equal(api.getPrefs().appearance, "dark");
+  assert.equal(dark.disabled, false);
+  assert.equal(system.disabled, false);
+  assert.equal(dark.checked, true);
+  assert.equal(release.value, "unsaved-release");
+  api.onPreferences({ ...rendererPrefs(), appearance: "light" });
+  assert.equal(theme.preference, "light");
+  assert.equal(dark.checked, false);
+});
+
+test("the disabled Dark mode switch follows live System theme changes without re-rendering the form", () => {
+  const events = {};
+  const theme = { preference: "system", effectiveTheme: "light" };
+  const dark = { checked: false, addEventListener() {} };
+  const { app, api } = createRendererHarness({
+    window: { githubTeamTheme: theme, addEventListener(name, handler) { events[name] = handler; } },
+    elements: { "appearance-dark": dark },
+  });
+  api.setState({ authenticated: false, accounts: [], notifications: [] });
+  api.setPrefs(rendererPrefs());
+  api.setView("settings");
+  api.render();
+  const markup = app.innerHTML;
+  for (const effective of ["dark", "light"]) {
+    theme.effectiveTheme = effective;
+    events.appearancechange();
+    assert.equal(dark.checked, effective === "dark");
+    assert.equal(dark.disabled, true);
+    assert.equal(app.innerHTML, markup);
+  }
+});
+
+test("a failed Appearance save rolls back and exposes an alert", async () => {
+  const theme = { preference: "dark", effectiveTheme: "dark", setPreference(value) { this.preference = value; this.effectiveTheme = value; } };
+  const dark = { checked: true, addEventListener(name, handler) { this[name] = handler; } };
+  const error = { textContent: "" };
+  const { app, api } = createRendererHarness({
+    window: { githubTeamTheme: theme },
+    elements: { "appearance-dark": dark, "appearance-error": error },
+    fetch: path => path === "api/appearance" ? Promise.reject(new Error("Disk is read-only")) : new Promise(() => {}),
+  });
+  api.setState({ authenticated: false, accounts: [], notifications: [] });
+  api.setPrefs({ ...rendererPrefs(), appearance: "dark" });
+  api.setView("settings");
+  api.render();
+  dark.checked = false;
+  await dark.change();
+  assert.equal(theme.preference, "dark");
+  assert.equal(dark.checked, true);
+  assert.equal(dark.disabled, false);
+  assert.match(error.textContent, /Could not save appearance: Disk is read-only/);
+  assert.match(app.innerHTML, /id="appearance-error" role="alert"/);
 });
 
 test("render keeps the current dashboard visible and surfaces later load errors", () => {
@@ -2287,7 +2486,7 @@ function createRendererHarness(overrides = {}) {
   };
   const sandbox = {
     document,
-    window: { CSS: { escape: cssEscape }, githubTeamStandalone: !!overrides.standalone },
+    window: { CSS: { escape: cssEscape }, githubTeamStandalone: !!overrides.standalone, addEventListener() {}, ...overrides.window },
     crypto: { randomUUID: () => "b3a61b14-b22c-426e-9a4b-495606e2bc3a" },
     CSS: { escape: cssEscape },
     EventSource: overrides.EventSource ?? function () { throw new Error("disabled"); },

@@ -54,6 +54,8 @@ let pendingState = null;
 let updateAvailable = null;
 let applyingUpdate = false;
 let savingAutoApply = false;
+let savingAppearance = false;
+let appearanceError = "";
 let nextPollAt = null;
 let pollCountdownTimer = null;
 // Monotonic revision of the snapshot currently applied. fetchedAt is a wall-clock display
@@ -70,6 +72,7 @@ function adoptState(payload) {
   if (!matchesRepository(payload)) return false;
   state = payload.dashboard;
   prefs = payload.prefs;
+  syncAppearance(prefs);
   if (state && Array.isArray(state.accounts)) discoveredAccounts = state.accounts;
   loadError = null;
   adoptAppliedRev();
@@ -448,7 +451,7 @@ const ICONS = {
   funnel: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>',
 };
 
-const LOGO = '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6.766 11.328c-2.063-.25-3.516-1.734-3.516-3.656 0-.781.281-1.625.75-2.188-.203-.515-.172-1.609.063-2.062.625-.078 1.468.25 1.968.703.594-.187 1.219-.281 1.985-.281.765 0 1.39.094 1.953.265.484-.437 1.344-.765 1.969-.687.218.422.25 1.515.046 2.047.5.593.766 1.39.766 2.203 0 1.922-1.453 3.375-3.547 3.64.531.344.89 1.094.89 1.954v1.625c0 .468.391.734.86.547C13.781 14.359 16 11.53 16 8.03 16 3.61 12.406 0 7.984 0 3.563 0 0 3.61 0 8.031a7.88 7.88 0 0 0 5.172 7.422c.422.156.828-.125.828-.547v-1.25c-.219.094-.5.156-.75.156-1.031 0-1.64-.562-2.078-1.609-.172-.422-.36-.672-.719-.719-.187-.015-.25-.093-.25-.187 0-.188.313-.328.625-.328.453 0 .844.281 1.25.86.313.452.64.655 1.031.655s.641-.14 1-.5c.266-.265.47-.5.657-.656"/></svg>';
+const LOGO = '<svg viewBox="0 0 128 128" aria-hidden="true"><use href="octo.svg#octo"></use></svg>';
 
 const ACCT_STATUS = {
   ok: { tone: "success", label: "Full access" },
@@ -881,6 +884,7 @@ function onUpdateAvailable(payload) {
 }
 
 function onPreferences(nextPrefs) {
+  syncAppearance(nextPrefs);
   if (standalone && (!prefs || !state)) return;
   if (!nextPrefs || typeof nextPrefs !== "object") return;
   if (prefs && Object.hasOwn(prefs, "selectedRepository") && nextPrefs.selectedRepository !== prefs.selectedRepository) return;
@@ -892,7 +896,56 @@ function onPreferences(nextPrefs) {
   }
 }
 
+function syncAppearance(nextPrefs) {
+  if (savingAppearance || !nextPrefs || !Object.hasOwn(nextPrefs, "appearance")) return;
+  window.githubTeamTheme?.setPreference(nextPrefs.appearance);
+  updateAppearanceControls();
+}
+
+function updateAppearanceControls() {
+  const theme = window.githubTeamTheme;
+  if (!theme) return;
+  const system = document.getElementById("appearance-system");
+  const dark = document.getElementById("appearance-dark");
+  if (system) {
+    system.checked = theme.preference === "system";
+    system.disabled = savingAppearance;
+  }
+  if (dark) {
+    dark.checked = theme.effectiveTheme === "dark";
+    dark.disabled = savingAppearance || theme.preference === "system";
+  }
+}
+
+window.addEventListener("appearancechange", updateAppearanceControls);
+
+async function saveAppearance(appearance) {
+  if (savingAppearance) return;
+  const focused = document.activeElement;
+  const previous = window.githubTeamTheme.preference;
+  savingAppearance = true;
+  appearanceError = "";
+  document.getElementById("appearance-error").textContent = "";
+  window.githubTeamTheme.setPreference(appearance);
+  updateAppearanceControls();
+  try {
+    const data = await postJSON("api/appearance", { appearance });
+    window.githubTeamTheme.setPreference(data.appearance);
+    if (prefs) prefs.appearance = data.appearance;
+  } catch (error) {
+    window.githubTeamTheme.setPreference(previous);
+    appearanceError = "Could not save appearance: " + (error.message || String(error));
+  } finally {
+    savingAppearance = false;
+    updateAppearanceControls();
+    if (focused?.isConnected && !focused.disabled && document.activeElement === document.body) focused.focus();
+    const error = document.getElementById("appearance-error");
+    if (error) error.textContent = appearanceError;
+  }
+}
+
 function onSnapshot(payload) {
+  syncAppearance(payload?.prefs);
   const dashboard = payload?.dashboard;
   const metadata = dashboard || payload;
   if (prefs && Object.hasOwn(prefs, "selectedRepository")
@@ -2709,10 +2762,12 @@ function statsHtml() {
   "</div>";
 }
 
-function toggle(id, title, desc, checked) {
+function toggle(id, title, desc, checked, disabled = false) {
   return '<div class="toggle-row"><span><span class="tl">' + esc(title) + "</span>" +
-    (desc ? '<span class="td">' + esc(desc) + "</span>" : "") + "</span>" +
-    '<label class="switch"><input type="checkbox" id="' + id + '" ' + (checked ? "checked" : "") + ' /><span class="slider"></span></label></div>';
+    (desc ? '<span class="td" id="' + id + '-description">' + esc(desc) + "</span>" : "") + "</span>" +
+    '<label class="switch"><input type="checkbox" role="switch" id="' + id + '" aria-label="' + esc(title) + '"' +
+    (desc ? ' aria-describedby="' + id + '-description"' : "") +
+    (checked ? " checked" : "") + (disabled ? " disabled" : "") + ' /><span class="slider"></span></label></div>';
 }
 
 function filtersView() {
@@ -2794,8 +2849,17 @@ function pipelineEditorHtml() {
 function settingsView() {
   const n = prefs.notifications || {};
   const limit = (state.reviewLimit || 10);
+  const appearance = window.githubTeamTheme?.preference || prefs.appearance || "system";
+  const dark = window.githubTeamTheme?.effectiveTheme === "dark";
   return '<div class="page">' +
-    '<div class="page-head"><h2>Settings</h2><p>Tune the review queue, team, delivery health, and notifications. Manage projects on the Repositories page and credentials on the Accounts page.</p></div>' +
+    '<div class="page-head"><h2>Settings</h2><p>Tune appearance, the review queue, team, delivery health, and notifications. Manage projects on the Repositories page and credentials on the Accounts page.</p></div>' +
+    '<div class="section"><h3>Appearance</h3>' +
+      '<p class="hint">Changes apply and save immediately.</p>' +
+      toggle("appearance-system", "Follow system appearance", "Switch automatically when your device appearance changes.",
+        appearance === "system", savingAppearance) +
+      toggle("appearance-dark", "Dark mode", "Used when Follow system appearance is off.",
+        dark, savingAppearance || appearance === "system") +
+      '<div class="pipeline-err" id="appearance-error" role="alert">' + esc(appearanceError) + '</div></div>' +
     '<div class="section"><h3>Repository sync</h3><p class="hint" id="item-limit-hint">Load the most recently updated open items first. ' +
       'This limit applies separately to PRs and issues in the selected repository, before fetching full details, to reduce GitHub API usage. Default: 200. Higher limits use more quota.</p>' +
       '<div class="field"><label for="max-open-items">Maximum open items</label><input type="number" id="max-open-items" min="1" max="10000" step="1" required ' +
@@ -3157,6 +3221,13 @@ function isSettingsSaveShortcut(event) {
 
 function wire() {
   wireRepositories();
+  const systemAppearance = document.getElementById("appearance-system");
+  if (systemAppearance) systemAppearance.addEventListener("change", () =>
+    saveAppearance(systemAppearance.checked ? "system" : window.githubTeamTheme.effectiveTheme));
+  const darkAppearance = document.getElementById("appearance-dark");
+  if (darkAppearance) darkAppearance.addEventListener("change", () =>
+    saveAppearance(darkAppearance.checked ? "dark" : "light"));
+  updateAppearanceControls();
   const addSessionProject = document.getElementById("add-session-project");
   if (addSessionProject) addSessionProject.addEventListener("click", () => saveSessionProject("add"));
   const saveSessionSelection = document.getElementById("save-session-project");

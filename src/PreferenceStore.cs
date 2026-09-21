@@ -13,6 +13,17 @@ internal sealed class PreferenceStore(string directory)
 
     public string DirectoryPath => Path.GetDirectoryName(_path)!;
 
+    internal static string Appearance(JsonObject prefs)
+    {
+        if (!prefs.ContainsKey("appearance")) { return "system"; }
+        if (prefs["appearance"] is JsonValue value && value.TryGetValue<string>(out var appearance) &&
+            appearance is "system" or "light" or "dark")
+        {
+            return appearance;
+        }
+        throw new InvalidDataException("appearance must be system, light, or dark.");
+    }
+
     internal static int MaxOpenItems(JsonObject prefs)
     {
         if (!prefs.ContainsKey("maxOpenItems")) { return 200; }
@@ -26,6 +37,7 @@ internal sealed class PreferenceStore(string directory)
     public static JsonObject Defaults() => new()
     {
         ["mode"] = "review",
+        ["appearance"] = "system",
         ["release"] = DashboardConstants.CurrentRelease,
         ["showDrafts"] = false,
         ["maxOpenItems"] = 200,
@@ -67,6 +79,7 @@ internal sealed class PreferenceStore(string directory)
             var prefs = await ReadCoreAsync(cancellationToken);
             update(prefs);
             _ = MaxOpenItems(prefs);
+            _ = Appearance(prefs);
             Directory.CreateDirectory(DirectoryPath);
             var temporary = Path.Combine(DirectoryPath, $".preferences-{Guid.NewGuid():N}.tmp");
             try
@@ -131,6 +144,7 @@ internal sealed class PreferenceStore(string directory)
             // The data directory is created only when a preference is saved.
         }
         _ = MaxOpenItems(prefs);
+        _ = Appearance(prefs);
         return prefs;
     }
 }

@@ -23,30 +23,37 @@ func externalURL(_ url: URL) -> Bool {
     return url.scheme == "ghapp" && url.host == "session" && url.path == "/new"
 }
 
-func writeIcons(to directory: String) throws {
+func appearanceMessage(_ text: String) -> (preference: String, dark: Bool)? {
+    let parts = text.split(separator: ":").map(String.init)
+    guard parts.count == 3, parts[0] == "appearance",
+          ["system", "light", "dark"].contains(parts[1]),
+          ["light", "dark"].contains(parts[2]),
+          parts[1] == "system" || parts[1] == parts[2] else { return nil }
+    return (parts[1], parts[2] == "dark")
+}
+
+func writeIcons(from source: String, to directory: String) throws {
+    guard let image = NSImage(contentsOfFile: source),
+          let original = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+          original.width == 1024, original.height == 1024 else {
+        throw NSError(domain: "GitHubTeamApp", code: 1,
+                      userInfo: [NSLocalizedDescriptionKey: "The approved 1024 x 1024 Octo PNG is missing or invalid."])
+    }
     for size in [16, 32, 128, 256, 512] {
         for scale in [1, 2] {
             let pixels = size * scale
-            let image = NSImage(size: NSSize(width: pixels, height: pixels))
-            image.lockFocus()
-            let bounds = NSRect(x: 0, y: 0, width: pixels, height: pixels)
-            NSColor(calibratedRed: 0.12, green: 0.14, blue: 0.18, alpha: 1).setFill()
-            NSBezierPath(roundedRect: bounds.insetBy(dx: CGFloat(pixels) * 0.04, dy: CGFloat(pixels) * 0.04),
-                         xRadius: CGFloat(pixels) * 0.21, yRadius: CGFloat(pixels) * 0.21).fill()
-            let text = "GH" as NSString
-            let attributes: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: CGFloat(pixels) * 0.43, weight: .bold),
-                .foregroundColor: NSColor.white
-            ]
-            let textSize = text.size(withAttributes: attributes)
-            text.draw(at: NSPoint(x: (CGFloat(pixels) - textSize.width) / 2,
-                                 y: (CGFloat(pixels) - textSize.height) / 2), withAttributes: attributes)
-            image.unlockFocus()
-            guard let tiff = image.tiffRepresentation,
-                  let bitmap = NSBitmapImageRep(data: tiff),
-                  let png = bitmap.representation(using: .png, properties: [:]) else {
+            guard let context = CGContext(data: nil, width: pixels, height: pixels, bitsPerComponent: 8,
+                                          bytesPerRow: pixels * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
                 throw NSError(domain: "GitHubTeamApp", code: 1,
                               userInfo: [NSLocalizedDescriptionKey: "Could not render the application icon."])
+            }
+            context.interpolationQuality = .high
+            context.draw(original, in: CGRect(x: 0, y: 0, width: pixels, height: pixels))
+            guard let resized = context.makeImage(),
+                  let png = NSBitmapImageRep(cgImage: resized).representation(using: .png, properties: [:]) else {
+                throw NSError(domain: "GitHubTeamApp", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "Could not encode the application icon."])
             }
             let suffix = scale == 2 ? "@2x" : ""
             try png.write(to: URL(fileURLWithPath: directory).appendingPathComponent("icon_\(size)x\(size)\(suffix).png"))
@@ -54,7 +61,7 @@ func writeIcons(to directory: String) throws {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     var window: NSWindow!
     var webView: WKWebView!
     var root: URL?
@@ -62,15 +69,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     var output = ""
     var diagnostics = ""
     var quitting = false
+    var windowShown = false
     var exitCode: Int32 = 0
     var startupTimer: Timer?
     var parentTimer: Timer?
+    var appearanceObservation: NSKeyValueObservation?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         installMenu()
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
+        configuration.userContentController.add(self, name: "appearance")
         webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -80,10 +90,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         window.title = "GitHub Team App"
         window.minSize = NSSize(width: 640, height: 480)
         window.contentView = webView
+        applyAppearance(preference: "system", dark: systemIsDark)
+        updateSystemAppearance()
+        appearanceObservation = NSApp.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.updateSystemAppearance() }
+        }
         window.setFrameAutosaveName("GitHubTeamApp")
         window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
         let arguments = Array(CommandLine.arguments.dropFirst())
         if arguments.count == 4, arguments[0] == "--url", arguments[2] == "--parent-pid",
            let url = loopbackURL(arguments[1]), let pid = Int32(arguments[3]), pid > 1 {
@@ -96,6 +109,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         } else {
             fail("Invalid desktop arguments. Launch the application normally, or use dotnet run.")
         }
+    }
+
+    var systemIsDark: Bool {
+        NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    }
+
+    func updateSystemAppearance() {
+        let theme = systemIsDark ? "dark" : "light"
+        let content = webView.configuration.userContentController
+        content.removeAllUserScripts()
+        content.addUserScript(WKUserScript(source: "window.githubTeamSystemTheme = '\(theme)';",
+                                          injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        guard let url = webView.url, let root, sameOrigin(url, root) else { return }
+        webView.evaluateJavaScript("window.githubTeamTheme?.setSystemTheme('\(theme)');") { _, error in
+            if let error { NSLog("Could not synchronize system appearance: %@", error.localizedDescription) }
+        }
+    }
+
+    func applyAppearance(preference: String, dark: Bool) {
+        window.appearance = preference == "system" ? nil : NSAppearance(named: dark ? .darkAqua : .aqua)
+        let background = dark
+            ? NSColor(srgbRed: 61 / 255.0, green: 59 / 255.0, blue: 58 / 255.0, alpha: 1)
+            : NSColor(srgbRed: 247 / 255.0, green: 244 / 255.0, blue: 239 / 255.0, alpha: 1)
+        window.backgroundColor = background
+        webView.underPageBackgroundColor = background
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.name == "appearance", message.frameInfo.isMainFrame,
+              let url = message.frameInfo.request.url, let root, sameOrigin(url, root),
+              let text = message.body as? String, let appearance = appearanceMessage(text) else { return }
+        applyAppearance(preference: appearance.preference, dark: appearance.dark)
     }
 
     func installMenu() {
@@ -263,6 +308,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         }
     }
 
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        if !windowShown {
+            windowShown = true
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
         let alert = NSAlert()
@@ -283,10 +336,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 }
 
 let arguments = Array(CommandLine.arguments.dropFirst())
-if arguments.count == 2 && arguments[0] == "--write-icons" {
-    do { try writeIcons(to: arguments[1]) }
+if arguments.count == 3 && arguments[0] == "--write-icons" {
+    do { try writeIcons(from: arguments[1], to: arguments[2]) }
     catch { fputs("Icon generation failed: \(error)\n", stderr); exit(1) }
 } else if arguments == ["--self-test"] {
+    precondition(appearanceMessage("appearance:system:dark")?.dark == true)
+    precondition(appearanceMessage("appearance:system:light")?.dark == false)
+    precondition(appearanceMessage("appearance:dark:dark")?.preference == "dark")
+    precondition(appearanceMessage("appearance:light:light")?.preference == "light")
+    for invalid in ["appearance:light:dark", "appearance:dark:light", "appearance:auto:dark",
+                    "appearance:system:invalid", "appearance:dark", "appearance:dark:dark:extra"] {
+        precondition(appearanceMessage(invalid) == nil)
+    }
     precondition(loopbackURL("http://127.0.0.1:5143") != nil)
     for invalid in ["https://127.0.0.1:5143", "http://evil.test:5143", "http://127.0.0.1:0",
                     "http://user@127.0.0.1:5143", "http://127.0.0.1:5143/?x=1"] {

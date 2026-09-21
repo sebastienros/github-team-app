@@ -9,6 +9,13 @@
 
 namespace desktop
 {
+inline std::optional<bool> AppearanceDark(std::wstring_view message)
+{
+    if (message == L"appearance:system:dark" || message == L"appearance:dark:dark") return true;
+    if (message == L"appearance:system:light" || message == L"appearance:light:light") return false;
+    return std::nullopt;
+}
+
 inline std::optional<std::wstring> LoopbackOrigin(std::wstring_view value)
 {
     constexpr std::wstring_view prefix = L"http://127.0.0.1:";

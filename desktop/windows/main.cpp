@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <dwmapi.h>
 #include <wrl.h>
 #include <WebView2.h>
 #include <filesystem>
@@ -79,6 +80,7 @@ class Application
 public:
     HWND window = nullptr;
     int exitCode = 0;
+    int showCommand = SW_SHOWNORMAL;
     std::wstring origin;
     std::wstring dataDirectory;
     Handle parent;
@@ -104,6 +106,8 @@ public:
 
     void Start()
     {
+        RefreshIcons();
+        if (failing) return;
         ComString version;
         const auto available = GetAvailableCoreWebView2BrowserVersionString(nullptr, &version.value);
         if (FAILED(available))
@@ -333,6 +337,28 @@ public:
         }
     }
 
+    void RefreshIcons()
+    {
+        const auto instance = GetModuleHandleW(nullptr);
+        const auto dpi = GetDpiForWindow(window);
+        for (const auto type : { ICON_BIG, ICON_SMALL })
+        {
+            const auto size = GetSystemMetricsForDpi(type == ICON_BIG ? SM_CXICON : SM_CXSMICON, dpi);
+            const auto icon = LoadImageW(instance, MAKEINTRESOURCEW(101), IMAGE_ICON, size, size, LR_SHARED);
+            if (!icon) { Fail(L"Could not load the Octo window icon.", HRESULT_FROM_WIN32(GetLastError())); return; }
+            SendMessageW(window, WM_SETICON, type, reinterpret_cast<LPARAM>(icon));
+        }
+    }
+
+    void PaintBackground(HDC dc)
+    {
+        RECT bounds{};
+        GetClientRect(window, &bounds);
+        const auto brush = CreateSolidBrush(darkAppearance ? RGB(61, 59, 58) : RGB(247, 244, 239));
+        FillRect(dc, &bounds, brush);
+        DeleteObject(brush);
+    }
+
 private:
     Handle backend, job, outputRead, inputWrite;
     std::thread reader;
@@ -342,8 +368,25 @@ private:
     ULONGLONG startedAt = 0, closingAt = 0;
     bool closing = false;
     bool failing = false;
+    bool darkAppearance = false;
+    bool windowShown = false;
     ComPtr<ICoreWebView2Controller> controller;
     ComPtr<ICoreWebView2> webView;
+
+    void ApplyAppearance(bool dark)
+    {
+        darkAppearance = dark;
+        const BOOL enabled = dark;
+        // Older Windows 10 builds do not expose dark title bars; keep their native chrome.
+        const auto titlebar = DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE, &enabled, sizeof(enabled));
+        if (FAILED(titlebar)) OutputDebugStringW((L"Dark title bar unavailable" + ErrorText(titlebar) + L"\n").c_str());
+        ComPtr<ICoreWebView2Controller2> background;
+        auto result = controller.As(&background);
+        if (SUCCEEDED(result)) result = background->put_DefaultBackgroundColor(
+            dark ? COREWEBVIEW2_COLOR{255, 61, 59, 58} : COREWEBVIEW2_COLOR{255, 247, 244, 239});
+        if (FAILED(result)) { Fail(L"Could not apply the webview appearance.", result); return; }
+        InvalidateRect(window, nullptr, TRUE);
+    }
 
     void OpenExternal(const std::wstring& url)
     {
@@ -402,7 +445,17 @@ private:
         if (FAILED(result)) { Fail(L"Could not configure webview settings.", result); return; }
 
         EventRegistrationToken token{};
-        result = webView->add_NavigationStarting(Callback<ICoreWebView2NavigationStartingEventHandler>(
+        result = webView->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+            [this](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT
+            {
+                ComString source, message;
+                if (FAILED(args->get_Source(&source.value)) || !source.value ||
+                    !desktop::SameOrigin(source.value, origin) ||
+                    FAILED(args->TryGetWebMessageAsString(&message.value)) || !message.value) return S_OK;
+                if (const auto dark = desktop::AppearanceDark(message.value)) ApplyAppearance(*dark);
+                return S_OK;
+            }).Get(), &token);
+        if (SUCCEEDED(result)) result = webView->add_NavigationStarting(Callback<ICoreWebView2NavigationStartingEventHandler>(
             [this](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT
             {
                 ComString uri;
@@ -443,6 +496,13 @@ private:
                     if (status != COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED)
                         Fail(L"Could not load the local dashboard. WebView2 error " + std::to_wstring(status) + L".");
                 }
+                else if (!windowShown)
+                {
+                    windowShown = true;
+                    ShowWindow(window, showCommand);
+                    UpdateWindow(window);
+                    Focus();
+                }
                 return S_OK;
             }).Get(), &token);
         if (SUCCEEDED(result)) result = webView->add_ProcessFailed(Callback<ICoreWebView2ProcessFailedEventHandler>(
@@ -478,6 +538,7 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
     if (!app) return DefWindowProcW(window, message, wParam, lParam);
     switch (message)
     {
+    case WM_ERASEBKGND: app->PaintBackground(reinterpret_cast<HDC>(wParam)); return 1;
     case WM_SIZE: app->Resize(); return 0;
     case WM_SETFOCUS: app->Focus(); return 0;
     case WM_CLOSE: app->Close(); return 0;
@@ -490,6 +551,7 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
         break;
     case WM_DPICHANGED:
     {
+        app->RefreshIcons();
         const auto rect = reinterpret_cast<RECT*>(lParam);
         SetWindowPos(window, nullptr, rect->left, rect->top, rect->right - rect->left,
                      rect->bottom - rect->top, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -516,6 +578,23 @@ int Run(HINSTANCE instance, int show)
     if (arguments == std::vector<std::wstring>{ L"--self-test" })
     {
         RunPolicyTests();
+        const auto resource = FindResourceW(instance, MAKEINTRESOURCEW(101), RT_GROUP_ICON);
+        const auto loaded = resource ? LoadResource(instance, resource) : nullptr;
+        const auto group = loaded ? static_cast<const BYTE*>(LockResource(loaded)) : nullptr;
+        if (!group || SizeofResource(instance, resource) != 6 + 9 * 14 || group[4] != 9 || group[5] != 0)
+            throw std::runtime_error("The Octo icon must contain all nine representations.");
+        std::size_t entry = 6;
+        for (const auto size : { 16, 20, 24, 32, 40, 48, 64, 128, 256 })
+        {
+            const auto dimension = size == 256 ? 0 : size;
+            if (group[entry] != dimension || group[entry + 1] != dimension ||
+                group[entry + 6] != 32 || group[entry + 7] != 0)
+                throw std::runtime_error("Invalid Octo icon dimensions or color depth.");
+            entry += 14;
+            const auto icon = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(101), IMAGE_ICON, size, size, 0));
+            if (!icon) throw std::runtime_error("Could not load an Octo icon representation.");
+            DestroyIcon(icon);
+        }
         for (const auto& value : { L"", L"C:\\path with spaces\\", L"a\\\"b", L"hi & start other", L"Unicode-\u03b1" })
         {
             const auto command = L"test.exe " + desktop::QuoteArgument(value);
@@ -529,6 +608,7 @@ int Run(HINSTANCE instance, int show)
     }
 
     Application app;
+    app.showCommand = show;
     if (arguments.size() == 4 && arguments[0] == L"--url" && arguments[2] == L"--parent-pid")
     {
         auto origin = desktop::LoopbackOrigin(arguments[1]);
@@ -554,7 +634,8 @@ int Run(HINSTANCE instance, int show)
     windowClass.hInstance = instance;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     windowClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(101));
-    windowClass.hIconSm = windowClass.hIcon;
+    windowClass.hIconSm = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(101), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
     windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     windowClass.lpszClassName = L"GitHubTeamAppWindow";
     if (!windowClass.hIcon || !RegisterClassExW(&windowClass)) throw std::runtime_error("Could not register the desktop window.");
@@ -570,8 +651,6 @@ int Run(HINSTANCE instance, int show)
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(file), L"&File");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"&View");
     SetMenu(window, menu);
-    ShowWindow(window, show);
-    UpdateWindow(window);
     app.Start();
     MSG message{};
     BOOL result;

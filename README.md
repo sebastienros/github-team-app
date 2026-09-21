@@ -84,6 +84,66 @@ saved preferences, choosing the first repository of an active account (otherwise
 the first saved repository). The migration is persisted on the next settings
 write. Pass an existing data directory with `--data-dir` to migrate its settings.
 
+## Appearance and application identity
+
+**Settings > Appearance** uses standard switches. **Follow system appearance**
+is on by default and follows OS appearance changes while the app is running.
+Turn it off to enable the **Dark mode** switch: on selects Dark, off selects
+Light. Turning off automatic switching keeps the current theme. While following
+the system, the disabled Dark mode switch reflects the effective OS appearance.
+Manual Light and Dark remain fixed until changed, regardless of the OS setting.
+The selection applies and saves immediately, independently of the other Settings
+fields; Cancel does not undo it. Failed saves restore the previous theme and show
+an error beside the switches. Existing settings without an appearance use System.
+
+Appearance is stored as `appearance` in the existing `preferences.json`, shared
+by native windows and browsers using the same backend/data directory. It is not
+stored in origin-bound localStorage: native launches can use different loopback
+ports without losing the preference. The server prefixes the blocking `theme.js`
+response with the saved setting, applying it before the document body renders.
+Native shells reveal their first window after the page loads, avoiding an
+unthemed blank webview during startup.
+Preference events synchronize open clients without replacing their unsaved form
+fields. Appearance does not change GitHub filters or dashboard cache keys.
+
+The macOS shell synchronizes window appearance and WKWebView background with the
+selected theme. It reports OS appearance separately from the window override so
+switching back to System cannot get stuck in a forced Light/Dark mode. Windows
+WebView2 observes OS changes through its media query; the shell updates the
+content background and dark title bar from same-origin appearance messages.
+Windows title-bar support depends on the OS version; unsupported older builds
+retain native chrome, and native Windows menus follow Windows rather than the
+web theme.
+
+Octo is the app's own identity, not the GitHub provider mark. The approved artwork
+has pointed ears, an inset feline face with pill eyes, and four curled tentacles.
+`assets/octo.svg` contains the shared, unmodified mark geometry; its `#octo` group
+inherits `currentColor` in both the loading header and rendered header. The
+header mark sits on a circular accent background: rose `#B11F4B` with a white
+mark in Light, and pink `#FD8EA1` with a charcoal `#292929` mark in Dark, using
+the existing accent and surface tokens.
+`assets/octo-dock.svg` is the approved pink tile used for the browser favicon.
+Provider icons and account/repository avatars retain their provider meaning.
+
+### Rebuilding native icons
+
+`desktop/icons/octo-1024.png` is the exact approved 1024-pixel tile raster and the
+authoritative native build input. Keep it and the approved Dock SVG in sync when
+intentionally revising the artwork; builds never redraw it or substitute a font.
+No external SVG renderer, ImageMagick, Python, or machine-specific font is needed.
+
+- macOS `desktop/macos/build.sh` uses the shell's `--write-icons SOURCE DIRECTORY`
+  mode to resample with Core Graphics into exact-pixel 16, 32, 128, 256 and 512
+  point representations at 1x and 2x. Apple's `iconutil` packages `AppIcon.icns`,
+  referenced by the existing `Info.plist`. Pixel dimensions do not depend on the
+  build machine's display scale. MSBuild tracks the PNG and ICNS in incremental
+  builds.
+- Windows `desktop/windows/create-icon.ps1` resamples the same PNG with built-in
+  System.Drawing and writes a multi-representation, alpha-preserving ICO at
+  16, 20, 24, 32, 40, 48, 64, 128 and 256 pixels. CMake tracks the source raster;
+  the existing `app.rc` embeds the generated icon. Window/taskbar icons select
+  the appropriate size on startup and DPI changes.
+
 ## Local cache and privacy
 
 ### Incremental GitHub synchronization
@@ -309,6 +369,13 @@ and static-loader packaging checks.
 These checks do not exercise an interactive WebView2 window. Windows desktop
 runtime testing (startup, navigation, external links, and shutdown) remains a
 separate manual step on a Windows machine with WebView2 Runtime installed.
+For appearance regression checks, open Settings in a browser/native shell:
+verify Follow system appearance tracks both OS transitions, the manual Dark mode
+switch ignores them, and re-enabling System immediately uses the current OS theme. Reload and restart
+on a different loopback port to check persistence and the initial header/theme.
+Changing appearance must retain unsaved fields, and a failed save must expose an
+error and restore the previous selection. Check both themes' header/favicons and
+the native icon at normal and high DPI.
 
 ## Attribution
 
@@ -317,6 +384,7 @@ Extracted from the Aspire team dashboard canvas and its standalone .NET port in
 and the MIT license are retained. This is an independent community application,
 not an official GitHub product.
 
-The GitHub mark is from [Primer Octicons](https://github.com/primer/octicons),
-copyright GitHub Inc., used under the MIT license in
-[`assets/Octicons.LICENSE.txt`](assets/Octicons.LICENSE.txt).
+The previous GitHub application mark came from
+[Primer Octicons](https://github.com/primer/octicons), copyright GitHub Inc.
+Its MIT notice is retained in [`assets/Octicons.LICENSE.txt`](assets/Octicons.LICENSE.txt).
+The application now uses the approved Octo artwork described above.

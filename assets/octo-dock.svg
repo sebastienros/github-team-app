@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024"><title>GitHub Team App - Octo</title><rect x="50" y="50" width="924" height="924" rx="214" fill="#fd8ea1"/><g transform="translate(116 116) scale(6.1875)" color="#292929">
+        <g fill="none" stroke="currentColor" stroke-width="10" stroke-linecap="round">
+          <path d="M47 77C45 87 39 95 28 94C17 93 14 82 22 79"></path>
+          <path d="M57 80V94C57 110 39 113 36 103"></path>
+          <path d="M71 80V94C71 110 89 113 92 103"></path>
+          <path d="M81 77C83 87 89 95 100 94C111 93 114 82 106 79"></path>
+        </g>
+        <path fill="currentColor" fill-rule="evenodd" d="M27 37C24 28 24 18 27 10C37 11 45 17 49 23C59 20 69 20 79 23C83 17 91 11 101 10C104 18 104 28 101 37C106 43 108 48 108 56C108 74 91 82 64 82C37 82 20 74 20 56C20 48 22 43 27 37Z M43 42C33 42 29 48 30 56C31 67 43 73 64 73C85 73 97 67 98 56C99 48 95 42 85 42C78 42 74 45 64 45C54 45 50 42 43 42Z"></path>
+        <g fill="currentColor">
+          <rect x="45" y="49" width="9" height="15" rx="4.5"></rect>
+          <rect x="74" y="49" width="9" height="15" rx="4.5"></rect>
+        </g>
+      </g></svg>

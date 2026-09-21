@@ -17,8 +17,8 @@
   </ItemGroup>
   <Target Name="BuildMacDesktop" AfterTargets="Build"
           Condition="$([MSBuild]::IsOSPlatform('OSX')) and '$(BuildDesktopShell)' != 'false' and ('$(RuntimeIdentifier)' == '' or $(RuntimeIdentifier.StartsWith('osx-')))"
-          Inputs="desktop/macos/main.swift;desktop/macos/Info.plist;desktop/macos/build.sh"
-          Outputs="$(TargetDir)GitHub Team App.app/Contents/MacOS/GitHubTeamApp">
+          Inputs="desktop/macos/main.swift;desktop/macos/Info.plist;desktop/macos/build.sh;desktop/icons/octo-1024.png"
+          Outputs="$(TargetDir)GitHub Team App.app/Contents/MacOS/GitHubTeamApp;$(TargetDir)GitHub Team App.app/Contents/Resources/AppIcon.icns">
     <Exec Command="bash &quot;$(MSBuildProjectDirectory)/desktop/macos/build.sh&quot; &quot;$(TargetDir)&quot;" />
   </Target>
   <Target Name="PublishMacDesktop" AfterTargets="Publish"

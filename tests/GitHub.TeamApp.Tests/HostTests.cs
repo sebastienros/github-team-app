@@ -49,6 +49,54 @@ public class HostTests
         }
     }
 
+    [Theory]
+    [InlineData("system")]
+    [InlineData("light")]
+    [InlineData("dark")]
+    public async Task AppearancePersistsWithoutChangingOtherSettingsOrCacheKeys(string appearance)
+    {
+        var directory = Directory.CreateTempSubdirectory();
+        try
+        {
+            var store = new PreferenceStore(directory.FullName);
+            var original = await store.ReadAsync(TestContext.Current.CancellationToken);
+            Assert.Equal("system", PreferenceStore.Appearance(original));
+            Assert.Equal("system", PreferenceStore.Appearance(new JsonObject()));
+            var key = DashboardCache.Key(original);
+            await store.UpdateAsync(p => p["appearance"] = appearance, TestContext.Current.CancellationToken);
+            var reopened = await new PreferenceStore(directory.FullName).ReadAsync(TestContext.Current.CancellationToken);
+            Assert.Equal(appearance, PreferenceStore.Appearance(reopened));
+            Assert.Equal(key, DashboardCache.Key(reopened));
+            reopened.Remove("appearance");
+            original.Remove("appearance");
+            Assert.True(JsonNode.DeepEquals(original, reopened));
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    [Theory]
+    [InlineData("\"auto\"")]
+    [InlineData("\"DARK\"")]
+    [InlineData("null")]
+    [InlineData("true")]
+    [InlineData("12")]
+    [InlineData("{}")]
+    public async Task InvalidPersistedAppearanceIsReportedWithoutOverwriting(string invalid)
+    {
+        var directory = Directory.CreateTempSubdirectory();
+        try
+        {
+            var path = Path.Combine(directory.FullName, "preferences.json");
+            var text = $"{{\"appearance\":{invalid}}}";
+            await File.WriteAllTextAsync(path, text, TestContext.Current.CancellationToken);
+            var store = new PreferenceStore(directory.FullName);
+            await Assert.ThrowsAsync<InvalidDataException>(() => store.ReadAsync(TestContext.Current.CancellationToken));
+            await Assert.ThrowsAsync<InvalidDataException>(() => store.UpdateAsync(p => p["appearance"] = "light", TestContext.Current.CancellationToken));
+            Assert.Equal(text, await File.ReadAllTextAsync(path, TestContext.Current.CancellationToken));
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
     [Fact]
     public async Task MalformedPreferencesAreReportedWithoutOverwritingThem()
     {
@@ -199,6 +247,32 @@ public class HostTests
                 Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
                 Assert.Contains("maxOpenItems", await response.Content.ReadAsStringAsync(timeout.Token));
                 Assert.Equal(321, (await new PreferenceStore(directory.FullName).ReadAsync(timeout.Token)).Number("maxOpenItems"));
+            }
+            foreach (var appearance in new[] { "system", "dark", "light" })
+            {
+                using var body = new StringContent($"{{\"appearance\":\"{appearance}\"}}", Encoding.UTF8, "application/json");
+                using var response = await http.PostAsync("/api/appearance", body, timeout.Token);
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+                Assert.Equal(appearance, JsonNode.Parse(await response.Content.ReadAsStringAsync(timeout.Token)).Text("appearance"));
+                using var bootstrap = await http.GetAsync("/theme.js", timeout.Token);
+                Assert.Equal("text/javascript", bootstrap.Content.Headers.ContentType?.MediaType);
+                Assert.Contains("no-store", bootstrap.Headers.CacheControl!.ToString());
+                Assert.StartsWith($"window.githubTeamAppearance = \"{appearance}\";\n", await bootstrap.Content.ReadAsStringAsync(timeout.Token));
+                Assert.Equal(321, (await new PreferenceStore(directory.FullName).ReadAsync(timeout.Token)).Number("maxOpenItems"));
+            }
+            foreach (var invalid in new[] { "{}", """{"appearance":null}""", """{"appearance":"auto"}""", """{"appearance":true}""" })
+            {
+                using var body = new StringContent(invalid, Encoding.UTF8, "application/json");
+                using var response = await http.PostAsync("/api/appearance", body, timeout.Token);
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("light", PreferenceStore.Appearance(await new PreferenceStore(directory.FullName).ReadAsync(timeout.Token)));
+            }
+            foreach (var asset in new[] { "/octo.svg", "/octo-dock.svg" })
+            {
+                using var response = await http.GetAsync(asset, timeout.Token);
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+                Assert.Equal("image/svg+xml", response.Content.Headers.ContentType?.MediaType);
+                Assert.Contains("GitHub Team App - Octo", await response.Content.ReadAsStringAsync(timeout.Token));
             }
         }
         finally
